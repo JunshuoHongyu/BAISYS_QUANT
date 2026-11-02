@@ -606,8 +606,6 @@ class FactorCalculator:
         if not rows:
             return
 
-        from sqlalchemy import text as sql_text
-
         INSERT_SQL = sql_text("""
         INSERT INTO public.dwd_factor_daily
             (trade_date, symbol, industry, composite_score, composite_rank,

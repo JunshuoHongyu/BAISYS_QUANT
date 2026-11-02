@@ -152,7 +152,6 @@ class IncrementalSyncEngine:
             half_b = remaining[mid:]
             logger.info(f"双管道: 前半段 {len(half_a)} 只 | 后半段 {len(half_b)} 只")
 
-            import threading
             results: dict = {"a": [0, []], "b": [0, []]}
 
             def run(label: str, half: list[str]):

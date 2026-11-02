@@ -72,7 +72,6 @@ def _scan_max_indicator_window() -> int:
     """
     import ast
     import glob
-    import os
 
     max_window = 0
 

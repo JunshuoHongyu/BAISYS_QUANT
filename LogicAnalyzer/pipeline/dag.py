@@ -148,7 +148,6 @@ class DagPipeline:
     ) -> None:
         if self.db_engine is None:
             return
-        import json
 
         sql = sql_text(f"""
         INSERT INTO public.{self.CHECKPOINT_TABLE}

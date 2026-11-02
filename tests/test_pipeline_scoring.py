@@ -28,7 +28,6 @@ def test_calc_momentum_desc_bear(sample_ohlcv_with_indicators: pd.DataFrame) -> 
 
 
 def test_calc_momentum_desc_missing_cols() -> None:
-    import pandas as pd
     df = pd.DataFrame({"close": [10.0] * 30})
     import pytest
     with pytest.raises(KeyError, match="DIF"):

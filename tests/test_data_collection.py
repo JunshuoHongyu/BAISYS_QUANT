@@ -178,8 +178,6 @@ class TestChipDistributionFetcher:
 @pytest.fixture(scope="module")
 def config_fixture():
     """返回一个最小配置对象（不依赖真实 DB / API）。"""
-    from unittest.mock import MagicMock
-
     cfg = MagicMock()
     cfg.ASHAREHUB_API_KEY = "test_key_123"
     cfg.ENABLE_FUNDAMENTALS = True

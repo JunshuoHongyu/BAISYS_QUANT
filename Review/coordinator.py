@@ -1106,7 +1106,6 @@ class StockAnalysisCoordinator:
 
         # 裁剪仅保留 final column order 中的列（step 10 可能加入了计算用列）
         from DataManager.ColumnNames import ColumnNames as CN
-        from Review.report import ReportService
         final_cols = ReportService.get_final_column_order(
             fund_flow_periods=self.config.FUND_FLOW_PERIODS
         )

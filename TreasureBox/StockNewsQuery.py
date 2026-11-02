@@ -67,6 +67,58 @@ def print_news_to_console(news_df: pd.DataFrame, stock_code: str) -> None:
     print("=" * 80)
     print(f"共 {len(news_df)} 条新闻，已全部显示。")
 
+def fetch_stock_news(stock_code: str, days: int = 30) -> pd.DataFrame:
+    """
+    获取个股最近 days 天的新闻（可复用核心查询，非交互式）。
+
+    供其他模块复用（如 SingleStockAnalyzer 自动查询 30 天新闻），
+    交互入口 query_stock_news() 也调用本函数。
+
+    Args:
+        stock_code: 6 位数字股票代码
+        days: 查询天数范围（按发布时间过滤）
+
+    Returns:
+        DataFrame | None: 列 [关键词, 新闻标题, 新闻内容, 发布时间]（按时间倒序）；
+                           无数据/失败返回空 DataFrame。
+    """
+    if not (isinstance(stock_code, str) and stock_code.isdigit() and len(stock_code) == 6):
+        raise ValueError(f"非法股票代码: {stock_code!r}（应为 6 位数字）")
+
+    try:
+        news_df: pd.DataFrame | None = ak.stock_news_em(symbol=stock_code)
+    except Exception as e:
+        print(f"[错误] 查询 {stock_code} 新闻接口失败: {e}")
+        return pd.DataFrame()
+
+    if news_df is None or news_df.empty:
+        return pd.DataFrame()
+
+    if "发布时间" in news_df.columns:
+        try:
+            cutoff_date = datetime.now() - timedelta(days=days)
+            news_df["发布时间_dt"] = pd.to_datetime(news_df["发布时间"], errors="coerce")
+            news_df = news_df[(news_df["发布时间_dt"].notna()) & (news_df["发布时间_dt"] >= cutoff_date)].copy()
+            news_df = news_df.sort_values(by="发布时间_dt", ascending=False)
+            news_df = news_df.drop(columns=["发布时间_dt"])
+        except Exception as e:
+            print(f"[警告] 对 '发布时间' 进行 {days} 天过滤和排序时失败，将显示所有新闻且可能未排序。错误详情: {e}")
+
+    if news_df.empty:
+        return pd.DataFrame()
+
+    required_cols = ["关键词", "新闻标题", "新闻内容", "发布时间"]
+    display_df = news_df[[col for col in required_cols if col in news_df.columns]].copy()
+
+    if "发布时间" in display_df.columns:
+        try:
+            display_df["发布时间"] = pd.to_datetime(display_df["发布时间"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            pass
+
+    return display_df
+
+
 def query_stock_news() -> None:
     print("--- 东方财富个股新闻查询工具 ---")
 
@@ -92,36 +144,12 @@ def query_stock_news() -> None:
     print(f"\n正在查询股票代码 {stock_code} 在过去 {days_to_query} 天内的最新新闻资讯...")
 
     try:
-        # 调用 akshare 接口获取个股新闻，确保 stock_code 是字符串
-        news_df: pd.DataFrame | None = ak.stock_news_em(symbol=stock_code)
+        # 复用核心查询逻辑（与其他模块同款过滤/排序/列裁剪）
+        display_df = fetch_stock_news(stock_code, days=days_to_query)
 
-        if news_df is None or news_df.empty:
-            print(f"\n[提示] 未能获取到股票 {stock_code} 的新闻数据，可能是今日无相关新闻或接口查询失败。")
+        if display_df is None or display_df.empty:
+            print(f"\n[提示] 股票 {stock_code} 在过去 {days_to_query} 天内没有新的新闻资讯（或接口查询失败）。")
             return
-
-        # 后续处理逻辑不变...
-        if "发布时间" in news_df.columns:
-            try:
-                cutoff_date = datetime.now() - timedelta(days=days_to_query)
-                news_df["发布时间_dt"] = pd.to_datetime(news_df["发布时间"], errors="coerce")
-                news_df = news_df[(news_df["发布时间_dt"].notna()) & (news_df["发布时间_dt"] >= cutoff_date)].copy()
-                news_df = news_df.sort_values(by="发布时间_dt", ascending=False)
-                news_df = news_df.drop(columns=["发布时间_dt"])
-            except Exception as e:
-                print(f"[警告] 对 '发布时间' 进行 {days_to_query} 天过滤和排序时失败，将显示所有新闻且可能未排序。错误详情: {e}")
-
-        if news_df.empty:
-            print(f"\n[提示] 股票 {stock_code} 在过去 {days_to_query} 天内没有新的新闻资讯。")
-            return
-
-        required_cols = ["关键词", "新闻标题", "新闻内容", "发布时间"]
-        display_df = news_df[[col for col in required_cols if col in news_df.columns]].copy()
-
-        if "发布时间" in display_df.columns:
-            try:
-                display_df["发布时间"] = pd.to_datetime(display_df["发布时间"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-            except (ValueError, TypeError):
-                pass
 
         print(f"成功获取 {stock_code} 的 {len(display_df)} 条新闻。")
 

@@ -1961,8 +1961,6 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
 
 def start_scheduler(config: Config | None = None) -> None:
     """启动定时调度（每日检查，按配置频率执行回测）。"""
-    import time
-
     import schedule as _schedule
 
     if config is None:

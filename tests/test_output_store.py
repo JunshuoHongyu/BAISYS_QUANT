@@ -244,7 +244,6 @@ class TestSignalMergeValidation:
 class TestPhase0Manifest:
     @pytest.mark.unit
     def test_phase0_manifest_upsert_and_merge_100(self, tmp_path, monkeypatch):
-        import numpy as np
         import BackTrading.indicator_cache as ic
         from BackTrading.indicator_cache import precompute_all_indicators
 
@@ -294,7 +293,6 @@ class TestPhase0Manifest:
 
     @pytest.mark.unit
     def test_phase0_replace_mode_no_manifest(self, tmp_path, monkeypatch):
-        import numpy as np
         import BackTrading.indicator_cache as ic
         from BackTrading.indicator_cache import precompute_all_indicators
 

@@ -233,8 +233,6 @@ def run_full_backtest(
     if engine_cfg is None:
         # 审计（成本外部化）：默认仍显式携带 CostModel（含逐笔最低佣金 + 分段表），
         # 但显式传入的 EngineConfig 若缺 cost_model 会在引擎内 fail-fast。
-        from BackTrading.domain.models import CostModel
-
         engine_cfg = EngineConfig(cost_model=CostModel())
     tl: list[dict[str, Any]] = []
     ec: list[dict[str, Any]] = []
@@ -2868,18 +2866,23 @@ def _run_single_backtest(
             _sig_lines.append(f"  卖出原因: {_reason_str}")
 
         # 2. 评分-收益配对 & IC（Spearman rank correlation）
-        _entry_map: dict[str, dict] = {}  # sym -> {score, entry_price, entry_dt}
+        # FIX(2026-10-29): 买卖按 FIFO 配对 — 原实现按 symbol 只保留"最后一次"买入，
+        # 同一标的多次买卖轮回时，旧卖出会误配到新买入（负持有天数 / 收益与 IC 失真）。
+        # 现在按时间顺序维护每 symbol 的未平仓买入队列，卖出时配对最早的买入。
+        _entry_queues: dict[str, deque] = {}  # sym -> deque[{score, entry_price, entry_dt}]
         for _t in _buys:
-            _entry_map[_t["symbol"]] = {
+            _q = _entry_queues.setdefault(_t["symbol"], deque())
+            _q.append({
                 "score": float(_t.get("buy_score", 0.0)),
                 "entry_price": float(_t["price"]),
                 "entry_dt": str(_t["time"]),
-            }
+            })
         _pairs = []  # (score, pnl_pct, hold_days, reason)
         for _t in _sells:
-            _e = _entry_map.get(_t["symbol"])
-            if _e is None:
+            _q = _entry_queues.get(_t["symbol"])
+            if not _q:
                 continue
+            _e = _q.popleft()  # 配对最早未平仓的买入（FIFO）
             _exit_price = float(_t["price"])
             _pnl_pct = (_exit_price - _e["entry_price"]) / _e["entry_price"]
             # 估算持有天数（字符串日期差近似）
