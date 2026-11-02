@@ -149,6 +149,10 @@ class EngineConfig:
     # 保留移动止盈的利润保护功能，但给趋势足够呼吸空间（与 min_hold_days 协同）。
     take_profit_pct: float = 12.0
     trail_profit_ratio: float = 8.0
+    # FIX(B2): 分段止盈 — T1 减半锁利 + T2 清仓；T1 后剩余仓位止损抬至保本
+    take_profit_p1_pct: float = 8.0
+    take_profit_p2_pct: float = 16.0
+    partial_profit_ratio: float = 0.5
     # kelly_fraction / position_a / risk_none_multiplier — DEAD KEY，引擎未消费；保留向后兼容但标记废弃
     kelly_fraction: float = 0.25  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除
     position_a: float = 0.3  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除

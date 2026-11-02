@@ -658,6 +658,10 @@ def _run_single_backtest(
     _entry_close: dict[str, float] = {}
     _buy_date: dict[str, str] = {}
     _entry_buy_score: dict[str, float] = {}
+    # FIX(B2): 已触发 T1 分段止盈（减半锁利）的标的集合；清仓时 discard。
+    # 集合内标的后继退出走 T2（浮盈≥tp2 或从最高点回撤≥trail 清仓剩余），
+    # 且 ATR 止损线下限抬至保本（entry_close × 1.005），防"锁利后利润全吐"。
+    _tp1_done: set[str] = set()
     # FIX(P1) Subtask-9：持有期限计数（按标的逐日递增，>max_hold_days 重新评估）
     _held_days: dict[str, int] = {}
 
@@ -669,6 +673,12 @@ def _run_single_backtest(
     _atr_stop = engine_cfg.atr_stop_mult
     _take_profit_pct = float(getattr(engine_cfg, "take_profit_pct", 15.0)) / 100.0
     _trail_profit_ratio = float(getattr(engine_cfg, "trail_profit_ratio", 10.0)) / 100.0
+    # FIX(B2): 分段止盈 — T1 减半锁利（take_profit_p1_pct + partial_profit_ratio）+ T2 清仓
+    _tp1_pct = float(getattr(engine_cfg, "take_profit_p1_pct", 8.0)) / 100.0
+    _tp2_pct = float(getattr(engine_cfg, "take_profit_p2_pct", 0.0)) / 100.0
+    if _tp2_pct <= 0:
+        _tp2_pct = _take_profit_pct  # FIX(B2): 未显式配置 T2 时回退旧 take_profit_pct，兼容旧配置
+    _partial_profit_ratio = float(getattr(engine_cfg, "partial_profit_ratio", 0.5))
     # FIX(B1): 最小持仓天数 — 评分反转/评分衰减类卖出需持仓≥N个交易日才允许触发，
     # 防止"买进次日即因技术性信号卖出"的超短线空转（ATR止损/摘牌强平/复牌兑现不受限）。
     _min_hold_days = int(getattr(engine_cfg, "min_hold_days", 5))
@@ -908,6 +918,7 @@ def _run_single_backtest(
                 _held_days.pop(s_syms[j], None)
                 _max_close_since_entry.pop(s_syms[j], None)
                 _entry_close.pop(s_syms[j], None)
+                _tp1_done.discard(s_syms[j])
                 # 原实现清仓时 pop(_buy_date) 存在风险：若执行顺序调整（如 next_open 模型
                 # 下买入挂单成交后又有同标的卖出挂单），会导致 T+1 守卫被绕过。
                 # 保留历史值不影响逻辑——T+1 守卫使用 _buy_date.get(s, "")，
@@ -1189,7 +1200,11 @@ def _run_single_backtest(
             # 普通卖出单仅当日有效（停牌/一字跌停即撤销、不重挂）。
             # 避免数据异常期间挂单无限滞留。
             p["_age"] = p.get("_age", 0) + 1
-            if not p.get("force") and p["_age"] > engine_cfg.order_expiry_days:
+            # FIX(B2): 风控卖出单（retry：ATR止损/止盈T1）在跌停锁仓/停牌时逐日重挂，
+            # 不因普通过期而放弃（否则止损单在跌停板等 1-2 天就撤销 → 仓位套死，
+            # 历史最多 25 次连续跌停锁仓巨亏）。retry 单最长重挂 20 个交易日（极端停牌兜底）。
+            _sell_expiry = 20 if p.get("retry") else engine_cfg.order_expiry_days
+            if not p.get("force") and p["_age"] > _sell_expiry:
                 logger.info(
                     f"[执行模型] {dt} {p['sym']} 卖出挂单过期"
                     f"（信号日 {p['sig_dt']}，已顺延 {p['_age'] - 1} 个交易日）→ 撤销"
@@ -1197,8 +1212,8 @@ def _run_single_backtest(
                 continue
             jj = sym_row.get(p["sym"])
             if jj is None or not adj_ok_ld[jj] or not has_volume_ld[jj]:
-                # 例外：强平单（ST/退市）逐日重挂直至成交（终态必须离场）
-                if p.get("force"):
+                # 例外：强平单（ST/退市）与风控单（retry）逐日重挂直至成交
+                if p.get("force") or p.get("retry"):
                     remaining_sells.append(p)
                 else:
                     logger.info(f"[执行模型] {dt} {p['sym']} 卖出挂单废单撤销（停牌/无行情）")
@@ -1221,7 +1236,7 @@ def _run_single_backtest(
                     _sink_inc("seal_sell_rejected", 1)
                     remaining_sells.append(p)
                     continue
-                sell_val += _process_sell(
+                _tp1_sold_val = _process_sell(
                     dt,
                     np.array([p["sym"]], dtype=object),
                     np.array([idx_ld[jj]], dtype=np.int32),
@@ -1235,6 +1250,10 @@ def _run_single_backtest(
                     s_sig_close=None,
                     s_reason=p.get("reason"),
                 )
+                sell_val += _tp1_sold_val
+                # FIX(B2): T1 分段止盈挂单成交（哪怕部分成交）→ 剩余仓位进入 T2 档 + 保本止损
+                if p.get("tp1") and _tp1_sold_val > 0:
+                    _tp1_done.add(p["sym"])
                 if p.get("force"):
                     pass  # 强平单一字跌停已按部分成交处理
                 else:
@@ -1262,7 +1281,7 @@ def _run_single_backtest(
             )
             _pv_sell = _prev_volume.get(p["sym"], 0.0)
             _vol_ref_sell = _pv_sell if _pv_sell > 0 else _DEFAULT_VOLUME_FALLBACK
-            sell_val += _process_sell(
+            _tp1_sold_val = _process_sell(
                 dt,
                 np.array([p["sym"]], dtype=object),
                 np.array([idx_ld[jj]], dtype=np.int32),
@@ -1277,6 +1296,10 @@ def _run_single_backtest(
                 s_force=bool(p.get("force", False)),
                 s_reason=p.get("reason"),
             )
+            sell_val += _tp1_sold_val
+            # FIX(B2): T1 分段止盈挂单成交（哪怕部分成交）→ 剩余仓位进入 T2 档 + 保本止损
+            if p.get("tp1") and _tp1_sold_val > 0:
+                _tp1_done.add(p["sym"])
         _pending_sells[:] = remaining_sells
         # ── 买入挂单（按信号日优先级顺序；一字涨停不可买） ──
         filled = 0
@@ -1602,16 +1625,18 @@ def _run_single_backtest(
             remaining_sells = []
             for p in _pending_sells:
                 p["_age"] = p.get("_age", 0) + 1
+                # FIX(B2): force 无限重挂；retry（止损/止盈T1）最长 20 交易日；普通单按配置过期
+                _p_expiry = 20 if p.get("retry") else _expiry
                 if p.get("force"):
                     # 强平单不设过期，逐日重挂
                     remaining_sells.append(p)
-                elif p["_age"] > _expiry:
+                elif p["_age"] <= _p_expiry:
+                    remaining_sells.append(p)
+                else:
                     logger.info(
                         f"[执行模型] {dt} {p['sym']} 卖出挂单过期（全市场停牌日，无行情）"
                         f"（信号日 {p['sig_dt']}，已顺延 {p['_age'] - 1} 个交易日）→ 撤销"
                     )
-                else:
-                    remaining_sells.append(p)
             _pending_sells[:] = remaining_sells
 
             remaining_buys = []
@@ -1646,15 +1671,17 @@ def _run_single_backtest(
                 _remaining_s_pit = []
                 for p in _pending_sells:
                     p["_age"] = p.get("_age", 0) + 1
+                    # FIX(B2): force 无限重挂；retry（止损/止盈T1）最长 20 交易日；普通单按配置过期
+                    _p_expiry_pit = 20 if p.get("retry") else _expiry_pit
                     if p.get("force"):
                         _remaining_s_pit.append(p)
-                    elif p["_age"] > _expiry_pit:
+                    elif p["_age"] <= _p_expiry_pit:
+                        _remaining_s_pit.append(p)
+                    else:
                         logger.info(
                             f"[执行模型] {dt} {p['sym']} 卖出挂单过期（PIT过滤后无行情）"
                             f"（信号日 {p['sig_dt']}，已顺延 {p['_age'] - 1} 个交易日）→ 撤销"
                         )
-                    else:
-                        _remaining_s_pit.append(p)
                 _pending_sells[:] = _remaining_s_pit
 
                 _remaining_b_pit = []
@@ -1848,6 +1875,16 @@ def _run_single_backtest(
             # 新逻辑：atr_stop = max_close_since_entry - prev_atr_arr * _atr_stop（随新高上移，保护利润）
             max_close_arr = np.array([_max_close_since_entry.get(s, prev_close_arr[i]) for i, s in enumerate(syms_str)])
             atr_stop = max_close_arr - prev_atr_arr * _atr_stop
+            # FIX(B2): T1 分段止盈已减仓的标的，止损线下限抬至保本（entry_close×1.005 覆盖手续费），
+            # 防止"浮盈 8% 减半锁利后，剩余仓位回吐全部利润甚至亏本"。止损判定仍用
+            # 上一交易日止损线 vs 今日收盘（与常规 ATR 止损同口径，无前视）。
+            if _tp1_done:
+                _be_entry = _entry_close
+                for _i, _s in enumerate(syms_str):
+                    if _s in _tp1_done and _s in _be_entry:
+                        _be_price = _be_entry[_s] * 1.005
+                        if np.isfinite(_be_price) and _be_price > 0:
+                            atr_stop[_i] = max(atr_stop[_i], _be_price)
             stop_hit_atr = (atr_stop > 0) & (close_adj < atr_stop) & adj_ok
         # _prev_bar_date 立即被当日数据覆盖，若不快照，撮合内"无前收禁买"守卫
         # 读到的恒是当日数据（死守卫）；快照后守卫可正确识别从未有过前收的标的
@@ -2103,20 +2140,31 @@ def _run_single_backtest(
                 ])
                 exit_gt = exit_gt & _hold_ok
                 exit_score_low = exit_score_low & _hold_ok
-            # 条件：持仓浮盈超过 take_profit_pct 且从最高点回撤超过 trail_profit_ratio
-            # _max_close_since_entry 在建仓/每日维护时已更新
+            # FIX(B2): 分段止盈 ——
+            #   T1：未减仓且浮盈≥tp1(默认8%) → 减半锁利（partial 挂单），剩余仓位保本止损；
+            #   T2：浮盈≥tp2(默认16%) → 清仓剩余；已减仓后从最高点回撤≥trail(默认8%) → 清仓剩余。
+            # 旧逻辑"浮盈≥12% 且 回撤≥8%"实测全周期仅触发 5/534 笔≈失效，盈利单全靠
+            # 评分反转/高位风险被动卖出。分段兑现把"被动卖出"改为"主动锁利"。
             exit_take_profit = np.zeros(len(syms_str), dtype=bool)
-            if _take_profit_pct > 0 and _trail_profit_ratio > 0:
-                _entry_close_arr = np.array([_entry_close.get(s, close_adj[i]) for i, s in enumerate(syms_str)])
-                _max_close_arr = np.array([_max_close_since_entry.get(s, close_adj[i]) for i, s in enumerate(syms_str)])
-                # 当前浮盈比例（相对入场价）
-                _pnl_pct = (close_adj - _entry_close_arr) / _entry_close_arr
-                # 从最高点的回撤比例
-                _drawdown_from_max = (_max_close_arr - close_adj) / _max_close_arr
-                exit_take_profit = (
-                    (_pnl_pct >= _take_profit_pct) &
-                    (_drawdown_from_max >= _trail_profit_ratio) &
-                    adj_ok
+            exit_tp1 = np.zeros(len(syms_str), dtype=bool)
+            _entry_close_arr = np.array([_entry_close.get(s, close_adj[i]) for i, s in enumerate(syms_str)])
+            _max_close_arr = np.array([_max_close_since_entry.get(s, close_adj[i]) for i, s in enumerate(syms_str)])
+            # 当前浮盈比例（相对入场价）
+            _pnl_pct = np.where(_entry_close_arr > 0, (close_adj - _entry_close_arr) / _entry_close_arr, 0.0)
+            # 从最高点的回撤比例
+            _dd_from_max = np.where(_max_close_arr > 0, (_max_close_arr - close_adj) / _max_close_arr, 0.0)
+            _tp1_flag = np.array([s in _tp1_done for s in syms_str])
+            if _tp1_pct > 0 and _partial_profit_ratio > 0:
+                exit_tp1 = (
+                    (~_tp1_flag) & (_pnl_pct >= _tp1_pct) & (_pnl_pct < _tp2_pct) & adj_ok
+                )
+            if _tp2_pct > 0:
+                # T2：无论是否已减仓，浮盈到位即整仓清（未减仓大阳直接到位也全落袋）
+                exit_take_profit = (_pnl_pct >= _tp2_pct) & adj_ok
+            if _trail_profit_ratio > 0:
+                # 回撤保护仅对已减仓的剩余仓位生效（未减仓给趋势呼吸空间，ATR/评分兜底）
+                exit_take_profit = exit_take_profit | (
+                    _tp1_flag & (_dd_from_max >= _trail_profit_ratio) & adj_ok
                 )
             
             # FIX(P1) Subtask-9：持有期限超限退出（无止损保护时避免永久持有）
@@ -2264,6 +2312,8 @@ def _run_single_backtest(
                         _sell_reasons[syms_str[_i]] = "atr_stop"
                     elif exit_take_profit[_i]:
                         _sell_reasons[syms_str[_i]] = "take_profit"
+                    elif exit_tp1[_i]:
+                        _sell_reasons[syms_str[_i]] = "take_profit_p1"
                     elif exit_gt[_i]:
                         _sell_reasons[syms_str[_i]] = "score_reversal"
                     elif exit_score_low[_i]:
@@ -2280,6 +2330,23 @@ def _run_single_backtest(
                 & ~force_exit
             )
             si_all = np.where(sel_all)[0]
+            # FIX(B2): T1 分段止盈减半挂单（partial）——独立于整仓退出路径。
+            # 与 si_all 互斥（同标的同日不重复挂单：整仓退出优先），且 stop_hit 硬止损优先。
+            sel_tp1 = (
+                held
+                & exit_tp1
+                & ~stop_hit
+                & (not_touched_down | _sim_limits)
+                & has_volume
+                & _t1_ok
+                & adj_ok
+                & ~force_exit
+            )
+            si_tp1_idx = np.where(sel_tp1)[0]
+            if len(si_all):
+                si_tp1 = np.setdiff1d(si_tp1_idx, si_all)
+            else:
+                si_tp1 = si_tp1_idx
             if _sim_limits:
                 # 跌停无量 → 未成交（撮合约束日志，可追溯）
                 _zv_sell = np.where(
@@ -2295,13 +2362,15 @@ def _run_single_backtest(
                 # FIX(B1): 半仓减仓（partial）→ 整仓卖出。原实现把所有非 ATR 止损的卖出
                 # 都标为 partial=True（一次卖一半），同一持仓被反复减仓 3~5 次才清仓 →
                 # 卖出笔数 = 买入笔数 × 5、交易成本翻倍。评分反转/评分衰减/止盈/高位风控
-                # 均是一次性趋势恶化的离场信号，应整仓退出；partial 仅保留给未来需要
-                # "部分止盈保本"的独立决策路径（当前无此信号），因此直接整仓。
+                # 均是一次性趋势恶化的离场信号，应整仓退出。
+                # FIX(B2): partial 半仓路径重新启用，但仅用于"T1 分段止盈减半锁利"
+                # （见下方 si_tp1 挂单），非 ATR 止损的常规卖出仍整仓。
                 si_partial = np.setdiff1d(si_all, si_stop)
                 # 0.1 执行时序：信号日收盘决策 → 挂单次日开盘成交
                 for _k in si_stop:
                     _pending_sells.append({
                         "sym": syms_str[_k], "si": idx[_k], "partial": False,
+                        "retry": True,  # FIX(B2): ATR 止损单跌停锁仓时逐日重挂（最长 20 交易日）
                         "sig_dt": str(dt), "sig_close": float(close_adj[_k]),
                         "reason": _sell_reasons.get(syms_str[_k], "atr_stop"),
                     })
@@ -2310,6 +2379,21 @@ def _run_single_backtest(
                         "sym": syms_str[_k], "si": idx[_k], "partial": False,
                         "sig_dt": str(dt), "sig_close": float(close_adj[_k]),
                         "reason": _sell_reasons.get(syms_str[_k], "score_reversal"),
+                    })
+                close_lookup = dict(zip(syms_str[adj_ok], close_raw[adj_ok]))
+                total_value = cash + _calc_market_value()
+
+            # FIX(B2): T1 分段止盈挂单 —— 浮盈达 tp1 减半锁利（partial=True + tp1 标记）。
+            # 成交后（_flush_pending 内）将标的加入 _tp1_done：剩余仓位止损抬保本、
+            # T2 浮盈≥tp2 或回撤≥trail 清仓剩余。与整仓退出互斥（si_tp1 已 setdiff si_all）。
+            if len(si_tp1):
+                for _k in si_tp1:
+                    _pending_sells.append({
+                        "sym": syms_str[_k], "si": idx[_k], "partial": True,
+                        "tp1": True, "retry": True,  # FIX(B2): T1 减半锁利单同样跌停排队重挂
+                        "sig_dt": str(dt),
+                        "sig_close": float(close_adj[_k]),
+                        "reason": "take_profit_p1",
                     })
                 close_lookup = dict(zip(syms_str[adj_ok], close_raw[adj_ok]))
                 total_value = cash + _calc_market_value()
@@ -2854,7 +2938,8 @@ def _run_single_backtest(
             _reason_counts[_r] = _reason_counts.get(_r, 0) + 1
         if _reason_counts:
             _reason_labels = {
-                "atr_stop": "ATR止损", "take_profit": "止盈", "score_reversal": "评分反转",
+                "atr_stop": "ATR止损", "take_profit": "止盈T2清仓", "take_profit_p1": "止盈T1减半",
+                "score_reversal": "评分反转",
                 "score_decay": "评分衰减", "risk_high": "高位风险", "force_exit": "强平",
                 "resume": "复牌兑现", "delist_force": "摘牌强平", "partial": "减仓",
                 "unknown": "未标记",

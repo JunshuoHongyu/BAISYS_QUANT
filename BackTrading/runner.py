@@ -695,6 +695,10 @@ def run_backtest_pipeline(
             min_hold_days=int(getattr(bt, "MIN_HOLD_DAYS", 5)),
             take_profit_pct=float(getattr(bt, "TAKE_PROFIT_PCT", 12.0)),
             trail_profit_ratio=float(getattr(bt, "TRAIL_PROFIT_RATIO", 8.0)),
+            # FIX(B2): 分段止盈参数从配置注入（与 TAKE_PROFIT_PCT 同源）
+            take_profit_p1_pct=float(getattr(bt, "TAKE_PROFIT_P1_PCT", 8.0)),
+            take_profit_p2_pct=float(getattr(bt, "TAKE_PROFIT_P2_PCT", 16.0)),
+            partial_profit_ratio=float(getattr(bt, "PARTIAL_PROFIT_RATIO", 0.5)),
             max_hold_days=int(getattr(bt, "MAX_HOLD_DAYS", 45)),
             cost_model=CostModel.from_backtest_config(
                 bt, trading_cost=config.app_config.trading_cost

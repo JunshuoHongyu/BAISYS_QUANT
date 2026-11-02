@@ -336,8 +336,8 @@ class ScoringParamsConfig(BaseModel):
                                     description="K线形态衰减下限（比例）")
     VOL_NORM_DENOMINATOR: float = Field(default=0.15, ge=0.01, le=1.0,
                                          description="金叉强度波动率归一化分母：(DIF-DEA)/ATR/此值→vol_factor")
-    ATR_STOP_MULT: float = Field(default=1.5, ge=0.5, le=5.0,
-                                  description="止损ATR倍数：止损价=close-ATR×此值")
+    ATR_STOP_MULT: float = Field(default=2.5, ge=0.5, le=5.0,
+                                  description="止损ATR倍数：止损价=close-ATR×此值（FIX(C1): 5.5→3.0→2.5 收紧止损）")
     TRAILING_STOP_HIGH_RATIO: float = Field(default=0.98, ge=0.9, le=1.0,
                                               description="移动止损高位触发比：close≥近N日最高价×此值")
     TRAILING_STOP_LOOKBACK: int = Field(default=10, ge=5, le=60,
@@ -460,8 +460,8 @@ class BacktestConfig(BaseModel):
                                           description="窗口预检 IS Sharpe 阈值，低于此值跳过该窗口全部 BO 寻优")
 
     # 待寻优参数范围（逗号分隔：min,max,step）
-    # FIX(P2-1): 寻优范围从 1.0~3.0 收紧（旧值 1.0~3.0 已合理，config.ini 从 3~8 改回 1~4）
-    ATR_STOP_MULT_RANGE: str = "1.0,4.0,0.5"
+    # FIX(C1): ATR 止损倍数寻优范围收紧至 1~3（旧 1~4），避免 BO 寻出过宽止损（上次寻出 3.5）
+    ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
     BOLL_NARROW_RATIO_RANGE: str = "0.6,1.2,0.1"
     CROSS_DECAY_DAYS_RANGE: str = "15,60,5"
     CONCLUSION_FULL_BULL_RANGE: str = "60,95,5"
@@ -483,6 +483,16 @@ class BacktestConfig(BaseModel):
                                    description="浮盈触发移动止盈的门槛（百分比）")
     TRAIL_PROFIT_RATIO: float = Field(default=8.0, ge=0, le=50,
                                       description="从最高点回撤触发止盈的比例（百分比）")
+    # FIX(B2): 分段止盈 — 旧逻辑"浮盈≥12% 且 回撤≥8%"几乎不触发（回测止盈仅 5/534 笔），
+    # 盈利单全部靠评分反转/高位风险被动卖出。改为两档主动兑现：
+    #   T1：浮盈 ≥ take_profit_p1_pct → 卖出 partial_profit_ratio 比例锁利，剩余仓位保本止损；
+    #   T2：已减仓后浮盈 ≥ take_profit_p2_pct 或从最高点回撤 ≥ trail_profit_ratio → 清仓剩余。
+    TAKE_PROFIT_P1_PCT: float = Field(default=8.0, ge=0, le=100,
+                                      description="分段止盈 T1 浮盈门槛（百分比）：达此值先卖 partial_profit_ratio 比例锁利")
+    TAKE_PROFIT_P2_PCT: float = Field(default=16.0, ge=0, le=200,
+                                      description="分段止盈 T2 浮盈门槛（百分比）：达此值清仓剩余仓位")
+    PARTIAL_PROFIT_RATIO: float = Field(default=0.5, ge=0, le=1.0,
+                                        description="分段止盈 T1 卖出比例（0.5=减半仓，剩余仓位让利润奔跑）")
     MAX_HOLD_DAYS: int = Field(default=45, ge=0, le=500,
                                description="持仓期限上限（交易日，超期后评分低于阈值则卖出）；0=关闭")
 
