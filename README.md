@@ -109,6 +109,21 @@
 - **前视合规** — 当日指标一律 shift(1) 后使用（如 AMOUNT_MA20），信号日收盘决策 → 次日开盘执行（A 股 T+1）
 - **效果** — 修复三类失真：①净值收益被持仓加权复权因子放大；②真实仓位低于目标仓位（目标 10% 实际仅 3.3%）；③费用按复权成交额高估
 
+### 执行层卖出纪律（分段止盈 / ATR 止损 / 跌停排队重挂）
+
+回测引擎的离场决策在**后复权空间**判定（止损价 = 后复权 close − ATR×mult），信号日收盘决策 → 次日开盘卖出（与买入同 T+1 时序）。参数见 [BACKTEST] 一节：
+
+- **ATR 止损** — `atr_stop_mult`（默认 `2.5`，寻优范围 `1.0,3.0,0.5`）：收盘价跌破 `close − ATR×2.5` 次日开盘整仓卖出（`reason=atr_stop`）。2026-11 起由 3.0 收紧至 2.5，配合跌停排队重挂控制单笔亏损。
+- **分段止盈 T1/T2（FIX(B2) 取代旧单段止盈）** — 旧 take_profit 逻辑实证仅触发 5 笔、浮盈 12%/回撤 8% 的门槛在趋势行情中几乎失效：
+  - **T1 减半锁利** — 浮盈 ≥ `take_profit_p1_pct`（默认 8%）时挂单卖出 `partial_profit_ratio`（默认 50%）仓位锁利（`reason=take_profit_p1`）；成交后剩余仓位止损价**抬至保本**（买入价），让利润奔跑。
+  - **T2 清仓剩余** — 剩余仓位浮盈 ≥ `take_profit_p2_pct`（默认 16%）→ 整仓清（`reason=take_profit`）；已减仓（T1 成交后）的剩余仓位另享**回撤保护**：自最高点回撤 ≥ `trail_profit_ratio`（默认 8%）→ 清仓剩余。`take_profit_pct`（默认 12%）仅作 T2 未显式配置（=0）时的回退门槛，兼容旧配置。
+  - ⚠️ 命名区别：本节的 T1/T2 是**执行层分段止盈门槛（% 浮盈）**；[SCORING_PARAMS] 的 `atr_t1_mult / atr_t2_mult`（默认 4.0/5.0）是**信号层目标价 ATR 倍数**，两者无关。
+- **跌停排队重挂（FIX(B2)）** — 卖出单次日一字跌停/停牌/全市场停牌日未成交时，按订单类型区分处理（`core.py` 三处过期逻辑：常规日挂单过期检查、PIT 过滤后无行情、全市场停牌日）：
+  - `force`（ST/退市强平）— **无限重挂**，逐日排队直至成交；
+  - `retry`（ATR 止损 / T1 锁利单）— **最长 20 个交易日**逐日重挂（跌停一字板流动性为 0，不能撤销止损单）;
+  - 普通单（评分反转/衰减/高位风控/T2）— 按 `order_expiry_days`（默认 2）过期撤销。
+- **其他离场** — 评分反转/衰减/高位风控整仓退出（`score_reversal/score_decay/risk_high`），`min_hold_days`（默认 5）内禁 T1/T2/评分类卖出，`max_hold_days`（默认 45）超期且评分低于阈值卖出。
+
 ### 涨跌停可成交量模型（撮合约束）
 
 - **固定比例模型（默认）** — 触板日按 `limit_seal_ratio`（一字板 5%）/ `limit_tradable_ratio`（炸板 30%）/ `limit_intraday_ratio`（盘中冲板 10%）× 连板衰减 `limit_seal_decay` 折算可成交量；开盘集合竞价档（9:25 仅知 open/前收限价，PIT 合规）取 `min(触板档, auction_fill_ratio)` 封顶，可成交量 = 前日量 × 比例
@@ -219,7 +234,7 @@ fund_flow_periods = 3,5,10        ; 短期资金流（仅允许 3,5,10 / 3,5,20 
 exempt_levels = 完全主升,趋势加速   ; 仅保留强势股
 
 [BACKTEST_CALIBRATED]
-atr_stop_mult = 2.0               ; 较宽止损
+atr_stop_mult = 2.5               ; 标准止损（配跌停排队重挂；寻优范围 1.0~3.0）
 kelly_fraction = 0.5              ; 激进仓位
 ```
 
@@ -584,7 +599,7 @@ cd BAISYS_QUANT
 |------|--------|------|
 | `boll_narrow_ratio` | <font color="red">`0.9`</font> | 窄布林判定：带宽/历史均值 < 此值 → 震荡（由回测优化） |
 | `cross_decay_days` | <font color="red">`37`</font> | 金叉信号衰减天数，天（由回测优化） |
-| `atr_stop_mult` | <font color="red">`2`</font> | ATR 止损倍数：止损价 = close - ATR × 此值（由回测优化） |
+| `atr_stop_mult` | <font color="red">`2.5`</font> | ATR 止损倍数：止损价 = close - ATR × 此值（由回测优化，2026-11 起 2.5 并配跌停排队重挂） |
 | `conclusion_full_bull` | <font color="red">`80`</font> | MACD 综合评分 ≥ 此值 → A 级（由回测优化） |
 | `golden_cross_bonus` | <font color="red">`10`</font> | R04: 金叉量价确认加分（由回测优化） |
 | `divergence_penalty` | <font color="red">`20`</font> | R41: 顶背离量缩扣分（由回测优化） |
@@ -613,6 +628,15 @@ cd BAISYS_QUANT
 | `initial_cash` | `1000000` | 初始资金 |
 | `signal_pipelines` | `6` | 信号预计算并行管道数 |
 | `execution_model` | `next_open` | 成交时点模型：`next_open` 信号次日开盘成交（默认，符合A股T+1）/ `vwap` 信号次日VWAP成交 |
+| `max_position_pct` | `0.12` | 单票仓位上限（每只标的最高占总资产 12%，FIX(C): 0.10→0.12 提升资金利用率） |
+| `min_hold_days` | `5` | 最小持仓天数（评分反转/衰减/止盈回撤类卖出须持仓满该天数；0=关闭） |
+| `take_profit_pct` | `12.0` | 浮盈门槛（%）：T1/T2 未显式配置时的回退值（兼容旧配置；当前 T1/T2=8/16 已显式配置） |
+| `trail_profit_ratio` | `8.0` | 自最高点回撤触发止盈比例（%）（B2: 已减仓后的 T2 回撤保护阈值） |
+| `take_profit_p1_pct` | `8.0` | 分段止盈 T1 浮盈门槛（%）：达此值先卖 `partial_profit_ratio` 比例锁利（FIX(B2)） |
+| `take_profit_p2_pct` | `16.0` | 分段止盈 T2 浮盈门槛（%）：达此值清仓剩余仓位（FIX(B2)，旧止盈逻辑仅触发 5 笔失效） |
+| `partial_profit_ratio` | `0.5` | T1 卖出比例（0.5=减半仓，剩余仓位让利润奔跑） |
+| `max_hold_days` | `45` | 持仓期限上限（交易日，超期后评分低于阈值则卖出；0=关闭） |
+| `order_expiry_days` | `2` | 普通卖出挂单过期天数（retry 止损/T1 锁利单最长 20 交易日重挂；强平单无限重挂） |
 | `bayesian_n_init_signal` | `12` | 信号层 Sobol 初始化组数 |
 | `bayesian_n_iter_signal` | `24` | 信号层 GP+qEI 迭代次数 |
 | `bayesian_n_init_portfolio` | `20` | 组合层 Sobol 初始化组数 |
