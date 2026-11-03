@@ -7,7 +7,7 @@ import pandas as pd
 from loguru import logger
 
 from BackTrading.engine import EngineConfig, _run_single_backtest
-from BackTrading.prepare import _build_params, prepare_backtest_data
+from BackTrading.prepare import _build_params, merge_best_params_into_structured, prepare_backtest_data
 
 # 3 个子策略的因子权重配置（设计为低相关）
 STRATEGY_WEIGHTS = {
@@ -32,6 +32,7 @@ def run_multi_strategy_backtest(
     params: dict[str, float],
     trade_log: list[dict[str, Any]],
     equity_curve: list[dict[str, Any]],
+    config: Any | None = None,
 ) -> dict[str, Any]:
     """多策略组合回测：运行 3 个子策略 + 上层资本分配。
 
@@ -41,12 +42,19 @@ def run_multi_strategy_backtest(
         params: WFO 最佳参数
         trade_log: 输出 — 合并后的逐笔交易记录
         equity_curve: 输出 — 合并后的每日净值
+        config: 应用配置（其 app_config 用于构造信号参数 base；与终验回测同一事实来源）
 
     Returns:
         {strategy_name: sub_result} 各子策略详情
+
+    Raises:
+        TypeError: config 缺失时（prepare._build_params 自重构后改单参并读取 cfg.app_config）。
     """
+    if config is None:
+        raise TypeError("run_multi_strategy_backtest 需要 config 参数（prepare._build_params 自重构后改单参并读取 cfg.app_config）")
     # 准备信号数据
-    structured = _build_params(type("cfg", (), {})(), params)
+    structured = _build_params(config)
+    merge_best_params_into_structured(params, structured)
     prepared = prepare_backtest_data(kline_df, params=structured, compute_exit_strategy=True, vectorized=True)
 
     # 止损价

@@ -1256,7 +1256,7 @@ def run_backtest_pipeline(
         if _enable_ms:
             try:
                 from BackTrading.multi_strategy import run_multi_strategy_backtest as _rms
-                _ms_result = _rms(kline_df, ecfg, best_params, trade_log, equity_curve)
+                _ms_result = _rms(kline_df, ecfg, best_params, trade_log, equity_curve, config=config)
                 logger.info(f"  多策略组合完成: {len(_ms_result)} 个子策略")
             except Exception as e:
                 logger.warning(f"  多策略组合回测异常: {e}")
@@ -1264,7 +1264,7 @@ def run_backtest_pipeline(
         # ── 压力测试 ──
         try:
             from BackTrading.stress_test import run_stress_tests as _rst
-            _stress_results = _rst(kline_df, ecfg, best_params)
+            _stress_results = _rst(kline_df, ecfg, best_params, config=config)
             _worst_dd = min((r.get("max_drawdown", 0) for r in _stress_results.values()), default=0)
             if _worst_dd < -0.3:
                 logger.warning(f"  压力测试: 历史极端场景最大回撤 {_worst_dd:.2%} > 30%，建议评估风险")
@@ -1275,7 +1275,7 @@ def run_backtest_pipeline(
         try:
             if bool(getattr(bt, "LIMIT_STRESS_ENABLED", True)):
                 from BackTrading.limit_stress import run_limit_stress as _rls
-                _limit_stress = _rls(kline_df, ecfg, best_params)
+                _limit_stress = _rls(kline_df, ecfg, best_params, config=config)
                 _wc = _limit_stress.get("worst_case", {})
                 logger.info(
                     f"  涨跌停压力: 买入成交率最低={_wc.get('min_buy_fill_rate', 1):.2%} "

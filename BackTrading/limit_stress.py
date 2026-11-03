@@ -39,7 +39,7 @@ from BackTrading.limit_calibration import (
     _classify_days,
     calibrate_limit_ratios,
 )
-from BackTrading.prepare import _build_params, prepare_backtest_data
+from BackTrading.prepare import _build_params, merge_best_params_into_structured, prepare_backtest_data
 
 # 窗口 warmup 天数（高发窗口前预留的交易日 buffer，让引擎建立 ADV/仓位状态）
 _LIMIT_STRESS_WARMUP_DAYS = 30
@@ -121,6 +121,7 @@ def run_limit_stress(
     prepared: pd.DataFrame | None = None,
     min_win_days: int = 5,
     top_n: int = 3,
+    config: Any | None = None,
 ) -> dict[str, Any]:
     """涨跌停场景专项压力测试（一字涨停/竞价触板/炸板高发窗口 worst-case 成本）。
 
@@ -135,6 +136,7 @@ def run_limit_stress(
         prepared: 可选已 prepare 的数据（测试注入；None 时内部走 prepare 管线）
         min_win_days: 高发窗口最小交易日数
         top_n: 每场景窗口数
+        config: 应用配置（prepared=None 时用于构造信号参数 base；与终验回测同一事实来源）
 
     Returns:
         {
@@ -142,9 +144,15 @@ def run_limit_stress(
           "windows": {场景名: [窗口报告, ...]},
           "worst_case": 全场景最差统计汇总,
         }
+
+    Raises:
+        TypeError: prepared 与 config 均缺失时（prepare._build_params 需真 Config 读取 cfg.app_config）。
     """
     if prepared is None:
-        structured = _build_params(type("cfg", (), {})(), params)
+        if config is None:
+            raise TypeError("run_limit_stress 内部走 prepare 管线时需要 config 参数（prepare._build_params 自重构后改单参并读取 cfg.app_config）")
+        structured = _build_params(config)
+        merge_best_params_into_structured(params, structured)
         prepared = prepare_backtest_data(
             kline_df, params=structured, compute_exit_strategy=True, vectorized=True
         )
