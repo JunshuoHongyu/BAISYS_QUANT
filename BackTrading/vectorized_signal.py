@@ -616,26 +616,19 @@ def _risk_level(
 ) -> np.ndarray:
     """逐 bar 风险等级 (HIGH/MEDIUM/LOW)。
 
-    FIX(A2/C)：原实现把 WEAK_TREND（MA 全空头排列，震荡市常见）直接判 HIGH，
-    导致：
-      1) 买入端一票否决 → 半数交易日候选池为空（0 买入，资金效率低）；
-      2) 退出评分 es[HIGH]=100 → 持仓稍有回调即"评分反转"卖出（超短线空转、
-         卖出=买入×5）。
-    WEAK_TREND 仅是趋势偏弱，降级为 MEDIUM（可买入，评分把关）；HIGH 仅保留
-    真正的深度弱势（MACD SUPER_WEAK）与强顶背离。MEDIUM 不再触发退出评分 100。
-
-    FIX(A3-2026-10-29) 方向反转联动：A1 单因子归因（56万行×3/5/10/20日）显示
-    除波动率压缩分外全部因子 IC<0，综合评分 IC=-0.025 → 原生评分方向反转
-    （score' = max - score，见 _composite_score）。
-    反转后「超跌/弱势」成为高分候选（低吸），「深度强势/追高」不再加分反而减分。
-    因此风险等级必须同步翻转语义：SUPER_STRONG（追高区）= HIGH 高风险（回避/
-    触发退出），SUPER_WEAK（超跌区）降级为 LOW（可买入）；WEAK_TREND 仍为 MEDIUM；
-    HIGH 仅保留强顶背离。否则反转后的高分票会被 HIGH 一票否决（自相矛盾）。
+    FIX(A4-2026-11-03) 方向重构 v2 联动（取代 A3 的反转语义）：
+    A3 曾把 SUPER_STRONG（追高区）判为 HIGH——那是"超跌高分+反转取反"时代的
+    语义。A4 重构后评分回归"强趋势=高分"（band_diag fwd=10 实证：超强趋势
+    +0.66% 为全因子最高收益段），若继续把 SUPER_STRONG 判 HIGH 会让 high 占
+    48% 样本、高分强趋势股被买入端一票否决（A4BT 修复前引擎 IC=-0.025、
+    高位风险卖出 387 次 vs 基线 216 次）。
+    修复：SUPER_STRONG 不再标 HIGH（回归可买）；HIGH 仅保留强顶背离
+    （has_top_div & 强强度，客观危险信号，与评分方向无关）。
+    退出评分 es[HIGH]=100 仍为强顶背离持仓的回撤保护兜底。
     """
     n = len(macd_trend_arr)
     rl = np.full(n, "LOW", dtype=object)
-    # A3 方向反转：追高区才是高风险（趋势已透支，IC 证实未来 3-20 日收益为负）
-    rl[macd_trend_arr == MACDTrend.SUPER_STRONG] = "HIGH"
+    # A4: SUPER_STRONG 回归 LOW（强趋势=高分候选，band_diag 实证收益最高）
     rl[regime == "WEAK_TREND"] = "MEDIUM"
     rl[has_top_div & (div_strength > 0.3)] = "HIGH"
     return rl
@@ -808,29 +801,31 @@ def _composite_score(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """逐 bar 综合评分和 level/conclusion。
 
-    FIX(A3-2026-10-29) 方向反转（行业标准 sign-flip）：
-    A1 单因子归因（56万行 × 3/5/10/20 日前瞻）显示除「波动率压缩分」(IC=+0.027~
-    +0.034, 唯一正) 外，全部 9 个成分因子 Spearman IC 均为负（-0.005~-0.073），
-    综合评分 IC=-0.025 → 高分档 Q5 收益反而垫底（-2.81%），胜率 35.6%，
-    这就是 return/sharpe 双低的终极根因。
-    修复：唯一正 IC 的波动率压缩分保持原向；其余 9 个负 IC 因子全部取反
-    （score' = max_score - score），使每个因子的贡献方向与未来收益正相关。
-    反转后综合评分语义从「追涨」翻转为「低吸/超跌反弹」。
+    FIX(A4-2026-11-03) 方向实证重构 v2（取代 A3 的全因子取反）：
+    A1 单因子归因（56万行 × 3/5/10/20 日前瞻）曾得出"全部成分因子 IC 为负"
+    的结论，但 11-02 校准参数重建缓存后的 band_diag 分档归因（候选区≥30、
+    314 万行、fwd=5/10 两套方向一致）显示 A3 反转方向与实证相反：
+      - 金叉/动能/斜率/量价/价格位置/动能加速 6 因子实证正向 → 回正向贡献
+      - 波动率压缩分实证单调负（-0.93）→ 反转 + 降权（A3 漏反）
+      - K 线形态分单调 +0.73 唯一强正 → 保持方向并升权至第一梯队
+      - MACD 趋势数值分反 U 型（强 +0.66 / 轻弱 -0.14 / 深弱 +0.45）→ 区间映射
+    评分语义回到「强趋势/多头确认=高分」，但 K 线（空头形态=高分）与波动率
+    压缩（不压缩=高分）两项保持低吸方向。
     """
     n = len(macd_trend_arr)
-    # A3 方向反转：原「强趋势=高分」(追涨) 翻转为「超跌=高分」(低吸)。
-    # A1: MACD趋势数值分 IC=-0.021~-0.036 → SUPER_WEAK 应得满分。
+    # FIX(A4-2026-11-03): MACD 趋势区间映射（band_diag 反U型实证）：
+    #   fwd=10 候选区: 超强 +0.66% / 轻弱 -0.14% / 深弱 +0.45%
+    #   → 强趋势高分、深弱中分、轻弱最低（轻弱=刚转弱最危险）。
     trend_score_map = {
-        MACDTrend.SUPER_STRONG: 0,
-        MACDTrend.STRONG: int(weights["MACD趋势"] * 2 // 5),
-        MACDTrend.WEAK: int(weights["MACD趋势"] * 3 // 5),
-        MACDTrend.SUPER_WEAK: int(weights["MACD趋势"]),
+        MACDTrend.SUPER_STRONG: int(weights["MACD趋势"]),
+        MACDTrend.STRONG: int(weights["MACD趋势"] * 0.8),
+        MACDTrend.WEAK: int(weights["MACD趋势"] * 0.15),
+        MACDTrend.SUPER_WEAK: int(weights["MACD趋势"] * 0.5),
     }
     trend_scores = np.vectorize(trend_score_map.get)(macd_trend_arr)
 
     # FIX(P1) Subtask-7：背离评分 float64 精度
-    # A3 方向反转：背离信号分 IC=-0.017~-0.026 → 无背离得满分（与金叉/动能取反一致），
-    # 出现底背离反而扣分（背离后的 3-20 日收益为负）。
+    # A4: 背离方向无分档实证（离散值），保持"顶背离扣分、底背离轻扣、无背离满分"。
     div_score = np.full(n, float(w_div), dtype=np.float64)
     bot_div = np.char.find(div_type.astype(str), Divergence.BOTTOM_DIVERGENCE) >= 0
     eff = div_strength * div_decay
@@ -841,29 +836,29 @@ def _composite_score(
     top_div = np.char.find(div_type.astype(str), Divergence.TOP_DIVERGENCE) >= 0
     div_penalty = np.where(top_div, float(divergence_penalty) * eff, 0.0)
 
-    # 量价：A3 反转 —— 原「放量上涨=加分」IC=-0.066~-0.073 全样本最负，
-    # 反转后量价配合越高得分越低（避免追高），量价走弱反而加分。
+    # A4: 量价回正向（band_diag: 放量上涨 fwd10 +0.56% > 走弱 +0.34%）；
+    #     顶背离当日不叠加量价分（保留）。
     vol_bonus = np.where(has_top_div, 0, vol_score)
-    vol_bonus = np.clip(w_vol - vol_bonus, 0, w_vol)
+    vol_bonus = np.clip(vol_bonus, 0, w_vol)
 
-    # FIX(P1-1): 先行指标纳入基础分
-    # A3 反转：仅波动率压缩分（唯一正 IC +0.027~+0.034）保持正向；
-    # 价格位置分 IC=-0.023~-0.049、动能加速分 IC=-0.027~-0.035 同样取反。
+    # FIX(A4): 先行指标方向修正 —
+    #   波动率压缩分单调负（-0.93）→ 反转（不压缩=高分）；
+    #   价格位置分/动能加速分回正向（高位/加速强=高分）。
     leading_bonus = np.zeros(n, dtype=np.float64)
     if squeeze_score is not None:
-        leading_bonus += squeeze_score
+        leading_bonus += (w_squeeze - np.clip(squeeze_score, 0, w_squeeze))
     if price_pos_score is not None:
-        leading_bonus += (w_price_pos - np.clip(price_pos_score, 0, w_price_pos))
+        leading_bonus += np.clip(price_pos_score, 0, w_price_pos)
     if mom_accel_score is not None:
-        leading_bonus += (w_mom_accel - np.clip(mom_accel_score, 0, w_mom_accel))
+        leading_bonus += np.clip(mom_accel_score, 0, w_mom_accel)
 
     total_base = (
         trend_scores
-        + (w_cross - np.clip(golden_score, 0, w_cross))      # A3: 金叉 IC=-0.028~-0.045 取反
-        + (w_mom - np.clip(mom_score, 0, w_mom))             # A3: 动能 IC=-0.005~-0.013 取反
-        + (w_slope - np.clip(slope_score, 0, w_slope))       # A3: DIF斜率 IC=-0.006~-0.019 取反
+        + np.clip(golden_score, 0, w_cross)              # A4: 金叉回正向（有金叉=加分）
+        + np.clip(mom_score, 0, w_mom)                   # A4: 动能回正向（动能强=加分）
+        + np.clip(slope_score, 0, w_slope)               # A4: 斜率回正向（斜率强=加分）
         + div_score
-        + (w_kp - np.clip(kp_score, 0, w_kp))                # A3: K线形态 IC=-0.037~-0.052 取反
+        + (w_kp - np.clip(kp_score, 0, w_kp))            # A4: K线保持"空头形态→高分"（单调+0.73 正向）
         - div_penalty
         + leading_bonus
     )
@@ -871,12 +866,12 @@ def _composite_score(
     total_base = np.clip(total_base, 0, total_max_base)
     total = np.clip(total_base + vol_bonus, 0, total_max_base + w_vol)
 
-    # level —— A3 方向反转：追高区(SUPER_STRONG)标记高风险，超跌区不再一票否决
+    # level —— A4: 强趋势不再标高风险（band_diag 实证收益最高）；
+    # D 级仅保留强顶背离（客观危险信号）
     level = np.full(n, "C", dtype=object)
     is_high_risk = np.zeros(n, dtype=bool)
-    rl_high = macd_trend_arr == MACDTrend.SUPER_STRONG
     top_div_strong = has_top_div & (div_strength > 0.3)
-    is_high_risk = rl_high | top_div_strong
+    is_high_risk = top_div_strong
     level[is_high_risk] = "D"
 
     fb = thresholds["fully_bull"]
@@ -888,10 +883,10 @@ def _composite_score(
     level[not_hr & (total_base >= osc) & (total_base < bl)] = "C"
     level[not_hr & (total_base < osc)] = "C"
 
-    # 简化 conclusion —— A3：语义随方向反转更新
+    # conclusion —— A4：语义随方向重构更新（评分高分=强趋势/多头确认）
     conclusion = np.where(is_high_risk, "D: 追高风险", "C: 正常")
-    conclusion[not_hr & (total_base >= fb)] = "A: 超跌强信号"
-    conclusion[not_hr & (total_base >= bl) & (total_base < fb)] = "B: 低吸信号"
+    conclusion[not_hr & (total_base >= fb)] = "A: 强趋势信号"
+    conclusion[not_hr & (total_base >= bl) & (total_base < fb)] = "B: 趋势确认"
     return total, level, conclusion
 
 
@@ -928,19 +923,22 @@ def compute_signals(
     score_p = params.get("scoring", {})
     th_p = params.get("thresholds", {})
     weights = {
-        # FIX(A2-2026-10-28): 评分权重重构 — 依据 A1b 高分区间(评分≥45)单因子 IC
-        #   A1b 实证（候选买入区间内，未来10日收益 Spearman IC）：
-        #     波动率压缩分  IC=+0.093 ✅ 唯一强正（BOLL收窄=变盘前兆）
-        #     MACD趋势数值分 IC=-0.080 ❌  金叉信号分 IC=-0.070 ❌
-        #     价格位置分     IC=-0.056 ❌  量价配合分 IC=-0.037 ❌
-        #     动能加速分     IC=-0.024 ❌  柱状动能分 IC=-0.024 ❌
-        #   → 结论：82/100 权重是"趋势已走强"追涨因子，高分=短期已大涨=追高接盘，
-        #     导致 Q1~Q5 分档在 Q5 反转（最高分档胜率仅 38%）、止盈 0 笔。
-        #   重构：追涨因子全面降权，波动率压缩升为第一权重。
-        "MACD趋势": 10, "金叉信号": 8, "柱状动能": 10,
-        "DIF斜率": 8, "背离信号": 5, "量价配合": 4, "K线形态": 7,
-        # FIX(P1-1): 先行指标（波动率压缩上调为第一权重，其余压缩）
-        "波动率压缩": 18, "价格位置": 4, "动能加速": 3,
+        # FIX(A4-2026-11-03): 评分方向实证重构 v2 —— 基于 band_diag 分档归因
+        #   （候选区综合评分>=30、314 万行、fwd=5/10 两套方向一致，11-02 终验缓存）：
+        #   A3 的"全因子取反"与当前参数下的实证方向相反，逐因子纠正：
+        #     - 金叉信号分  低分=有金叉 fwd10 +0.81%（高分档 -0.18）→ 金叉正贡献（A3 取反错）
+        #     - 柱状动能分  动能强 fwd10 +0.63~+0.72%（动能弱 -0.15%）→ 正贡献（A3 取反错）
+        #     - DIF斜评分   斜率强 +0.60%（弱 +0.22%）→ 正贡献（A3 取反错）
+        #     - 量价配合分  放量上涨 +0.56%（弱 +0.34%）→ 正贡献（A3 取反错）
+        #     - 价格位置分  价格高位 +0.58%（低位 +0.26%）→ 正贡献（A3 取反错）
+        #     - 动能加速分  加速强 +0.57%（弱 +0.34%）→ 正贡献（A3 取反错）
+        #     - 波动率压缩分 压缩强单调 -0.93（+0.50%→+0.16%）→ 唯一负向，反转（A3 漏反）
+        #     - K线形态分   单调 +0.73（Q1 +0.32%→Q5 +0.49%）→ 唯一强正，方向对、升权
+        #     - MACD趋势数值分 反U型（强 +0.66% / 轻弱 -0.14% / 深弱 +0.45%）→ 区间映射
+        "MACD趋势": 8, "金叉信号": 8, "柱状动能": 8,
+        "DIF斜率": 8, "背离信号": 5, "量价配合": 6, "K线形态": 16,
+        # FIX(A4): 波动率压缩降权+反转；价格位置/动能加速回正向并微升
+        "波动率压缩": 10, "价格位置": 6, "动能加速": 4,
     }
     # 归一化权重至总和 100，保证阈值 80/60/40 是统一的百分比语义
     _ws = sum(weights.values())
@@ -1100,17 +1098,17 @@ def compute_signals(
     ).astype(np.float64)
 
     # ── 趋势分数（复用 trend_arr 计算，避免重复调用 macd_trend） ──
-    # A3 方向反转：输出列同样取反（超跌=高分，与综合评分方向一致），
-    # 使 A1 因子归因重跑时能直接验证 IC 转正。
+    # A4 区间映射（与 _composite_score 一致，供归因验证）：
+    #   强趋势高分、深弱中分、轻弱最低（band_diag: 超强 +0.66% / 轻弱 -0.14% / 深弱 +0.45%）
     _trend_score_map = {
-        MACDTrend.SUPER_STRONG: 0.0,
-        MACDTrend.STRONG: 8.0,
-        MACDTrend.WEAK: 12.0,
-        MACDTrend.SUPER_WEAK: 20.0,
+        MACDTrend.SUPER_STRONG: float(weights["MACD趋势"]),
+        MACDTrend.STRONG: float(weights["MACD趋势"] * 0.8),
+        MACDTrend.WEAK: float(weights["MACD趋势"] * 0.15),
+        MACDTrend.SUPER_WEAK: float(weights["MACD趋势"] * 0.5),
     }
     trend_value_arr = np.vectorize(_trend_score_map.get)(trend_arr)
 
-    # A3: 反转后的背离贡献分（与 _composite_score 保持一致）
+    # A4: 背离输出列（无背离=满分，底背离=扣分；与 _composite_score 保持一致）
     _flip_div_score = np.full(n, float(w_div), dtype=np.float64)
     _flip_bot_div = np.char.find(div_type.astype(str), Divergence.BOTTOM_DIVERGENCE) >= 0
     _flip_eff = div_strength * div_decay
@@ -1125,19 +1123,20 @@ def compute_signals(
         "atr": atr.values,
         # 审计修复：macd_trend 恢复字符串类别（下游风险判断依赖此语义）
         "macd_trend": trend_arr,
-        # 新增数值分字段，与 prepare.py float 消费兼容（A3: 取反方向）
+        # 新增数值分字段，与 prepare.py float 消费兼容（A4: 区间映射）
         "macd_trend_value": trend_value_arr,
-        "golden_cross": (w_cross - np.clip(golden_score, 0, w_cross)).astype(np.float64),
-        "hist_momentum": (w_mom - np.clip(mom_score, 0, w_mom)).astype(np.float64),
-        "dif_slope": (w_slope - np.clip(slope_score, 0, w_slope)).astype(np.float64),
-        # A3: divergence 列输出反转后的背离贡献分（无背离=满分，底背离=扣分）
+        # A4: 输出列方向=合成方向（供归因验证）
+        "golden_cross": np.clip(golden_score, 0, w_cross).astype(np.float64),
+        "hist_momentum": np.clip(mom_score, 0, w_mom).astype(np.float64),
+        "dif_slope": np.clip(slope_score, 0, w_slope).astype(np.float64),
         "divergence": _flip_div_score.astype(np.float64),
-        "vol_price": (w_vol - np.clip(vol_score, 0, w_vol)).astype(np.float64),
+        "vol_price": np.clip(vol_score, 0, w_vol).astype(np.float64),
+        # A4: K线保持"空头形态→高分"（单调 +0.73 正向实证）
         "kline": (w_kp - np.clip(kp_score, 0, w_kp)).astype(np.float64),
-        # FIX(P1-1): 先行指标列（A3: 仅波动率压缩保持正向，其余取反）
-        "vol_squeeze": squeeze_score.astype(np.float64),
-        "price_position": (w_price_pos - np.clip(price_pos_score, 0, w_price_pos)).astype(np.float64),
-        "mom_acceleration": (w_mom_accel - np.clip(mom_accel_score, 0, w_mom_accel)).astype(np.float64),
+        # A4: 波动率压缩反转（压缩强=低分；band_diag 单调 -0.93 负向实证）
+        "vol_squeeze": (w_squeeze - np.clip(squeeze_score, 0, w_squeeze)).astype(np.float64),
+        "price_position": np.clip(price_pos_score, 0, w_price_pos).astype(np.float64),
+        "mom_acceleration": np.clip(mom_accel_score, 0, w_mom_accel).astype(np.float64),
         "stop_loss": stop_loss,
         "level": level_arr,
         "conclusion": conclusion_arr,

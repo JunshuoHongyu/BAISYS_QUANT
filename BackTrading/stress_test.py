@@ -7,7 +7,7 @@ import pandas as pd
 from loguru import logger
 
 from BackTrading.engine import EngineConfig, _run_single_backtest
-from BackTrading.prepare import _build_params, prepare_backtest_data
+from BackTrading.prepare import _build_params, merge_best_params_into_structured, prepare_backtest_data
 
 # 压力测试 warmup 天数（危机段前预留的交易日 buffer，
 # 让引擎建立 ADV 历史/仓位状态后再进入危机段，避免冷启动失真）
@@ -52,6 +52,7 @@ def run_stress_tests(
     kline_df: pd.DataFrame,
     engine_cfg: EngineConfig,
     params: dict[str, float],
+    config: Any | None = None,
 ) -> dict[str, dict[str, Any]]:
     """对历史极端场景逐一回测，报告回撤和 Sharpe。
 
@@ -59,12 +60,19 @@ def run_stress_tests(
         kline_df: 全量 K 线数据
         engine_cfg: 引擎配置
         params: WFO 最佳参数
+        config: 应用配置（其 app_config 用于构造信号参数 base；与终验回测同一事实来源）
 
     Returns:
         {scenario_name: {sharpe, max_drawdown, total_return, ...}}
+
+    Raises:
+        TypeError: config 缺失时（prepare._build_params 需真 Config 读取 app_config）。
     """
+    if config is None:
+        raise TypeError("run_stress_tests 需要 config 参数（prepare._build_params 自重构后改单参并读取 cfg.app_config）")
     # 准备信号
-    structured = _build_params(type("cfg", (), {})(), params)
+    structured = _build_params(config)
+    merge_best_params_into_structured(params, structured)
     prepared = prepare_backtest_data(kline_df, params=structured, compute_exit_strategy=True, vectorized=True)
 
     stop_mult = params.get("atr_stop_mult", 2.0)
