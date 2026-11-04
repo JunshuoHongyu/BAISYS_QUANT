@@ -98,6 +98,9 @@ _RANGE_TO_PARAM: dict[str, str] = {
     # 但显著膨胀搜索空间维度，固定为配置默认值，不参与WFO寻优
     "BUY_THRESHOLD_RANGE": "buy_threshold",
     "MAX_HOLDINGS_RANGE": "max_holdings",
+    # 2026-11-04 WFO 寻优扩展：单票仓位上限（组合层参数，is_signal=False，
+    # 评估复用信号缓存秒级完成；回撤控制从手工调参升级为月度自适应）
+    "MAX_POSITION_PCT_RANGE": "max_position_pct",
     # ── P4 组合优化器超参数 ──
     "OPTIMIZER_RISK_AVERSION_RANGE": "optimizer_risk_aversion",
     "OPTIMIZER_TURNOVER_PENALTY_RANGE": "optimizer_turnover_penalty",
@@ -135,6 +138,7 @@ _ACTIVE_RANGE_ATTRS = [
     "CONCLUSION_FULL_BULL_RANGE",
     "BUY_THRESHOLD_RANGE",
     "MAX_HOLDINGS_RANGE",
+    "MAX_POSITION_PCT_RANGE",  # 2026-11-04 单票仓位上限纳入 WFO 寻优
 ]
 
 
@@ -168,6 +172,7 @@ def build_spaces(
     active_param_names = {
         "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",
         "conclusion_full_bull", "buy_threshold", "max_holdings",
+        "max_position_pct",  # 2026-11-04 组合层参数（is_signal=False → portfolio 阶段秒级评估）
     }
     range_attr_map = {
         k: v for k, v in _RANGE_TO_PARAM.items()

@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     pbo             NUMERIC(6,4) DEFAULT 0.0,
     dsr             NUMERIC(6,4) DEFAULT 0.0,
     num_trials      INT DEFAULT 0,
-    adopted         BOOLEAN     NOT NULL DEFAULT FALSE
+    adopted         BOOLEAN     NOT NULL DEFAULT FALSE,
+    direction_audit JSONB
 );
 
 CREATE INDEX IF NOT EXISTS idx_{TABLE}_run_time ON {TABLE} (run_time DESC);
@@ -78,6 +79,8 @@ def ensure_table(engine: Any) -> None:
         # 需要 adopted 区分"门控通过已采纳"与"未采纳"——历史记录默认 FALSE，
         # 复盘读取只认 adopted=TRUE，历史未采纳记录不会污染复盘参数。
         ("adopted", "BOOLEAN NOT NULL DEFAULT FALSE"),
+        # 2026-11-04 方向回切防线：每次校准的方向审计快照（L1/L2/L3 + verdict）
+        ("direction_audit", "JSONB"),
     ]:
         try:
             if col == "lookback_days":
@@ -138,7 +141,7 @@ def get_last_adopted_run(engine: Any) -> dict[str, Any] | None:
                initial_cash, params, sharpe, sortino, calmar, total_return,
                annual_return, max_drawdown, win_rate, profit_factor, total_trades,
                status, config_hash, data_version, git_commit, pbo, dsr, num_trials,
-               adopted
+               adopted, direction_audit
         FROM {TABLE}
         WHERE status = 'success' AND adopted = TRUE
         ORDER BY run_time DESC
@@ -151,6 +154,8 @@ def get_last_adopted_run(engine: Any) -> dict[str, Any] | None:
     result = dict(row)
     if isinstance(result.get("params"), str):
         result["params"] = json.loads(result["params"])
+    if result.get("direction_audit") is not None and isinstance(result["direction_audit"], str):
+        result["direction_audit"] = json.loads(result["direction_audit"])
     return result
 
 
@@ -260,6 +265,7 @@ def record_run(
     config_hash: str = "",
     data_version: str = "",
     adopted: bool | None = None,
+    direction_audit: dict[str, Any] | None = None,
 ) -> None:
     metrics = dict(extra_metrics or {})
     sortino = metrics.pop("sortino_ratio", None) or metrics.get("sortino", 0)
@@ -282,12 +288,14 @@ def record_run(
             (run_time, frequency, backtest_start_date, out_of_sample_days,
              initial_cash, params, sharpe, total_return, max_drawdown, status,
              sortino, calmar, var_95, cvar_95, win_rate, profit_factor, total_trades,
-             git_commit, config_hash, data_version, pbo, dsr, num_trials, adopted)
+             git_commit, config_hash, data_version, pbo, dsr, num_trials, adopted,
+             direction_audit)
         VALUES
             (NOW(), :frequency, :backtest_start_date, :out_of_sample_days,
              :initial_cash, CAST(:params AS jsonb), :sharpe, :total_return, :max_drawdown, :status,
              :sortino, :calmar, :var_95, :cvar_95, :win_rate, :profit_factor, :total_trades,
-             :git_commit, :config_hash, :data_version, :pbo, :dsr, :num_trials, :adopted)
+             :git_commit, :config_hash, :data_version, :pbo, :dsr, :num_trials, :adopted,
+             CAST(:direction_audit AS jsonb))
     """)
     with engine.begin() as conn:
         conn.execute(sql, _pyval({
@@ -314,6 +322,7 @@ def record_run(
             "dsr": dsr,
             "num_trials": num_trials,
             "adopted": adopted,
+            "direction_audit": json.dumps(_pyval(direction_audit or {}), ensure_ascii=False),
         }))
     logger.info(f"回测记录已写入 {TABLE} (adopted={adopted})")
 

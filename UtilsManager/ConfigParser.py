@@ -468,9 +468,13 @@ class BacktestConfig(BaseModel):
     GOLDEN_CROSS_BONUS_RANGE: str = "5,20,5"
     DIVERGENCE_PENALTY_RANGE: str = "10,40,5"
     RISK_NONE_MULTIPLIER_RANGE: str = "0.5,2.0,0.25"
-    # FIX(P1-2): 寻优范围从 5~30 扩大到 30~60，避免寻优出低阈值导致大量低质量信号
+
     BUY_THRESHOLD_RANGE: str = "30,60,5"
     MAX_HOLDINGS_RANGE: str = "3,20,1"
+    # 2026-11-04 WFO 寻优扩展：单票仓位上限纳入月度自适（组合层参数，评估不触发信号重算）
+    # 当前生产 0.08 落带内偏下；步长 0.02 → 9 档离散；市场高波动期 BO 自动压低上限保回撤，
+    # 低迷期自动用足资金。GOLDEN_CROSS_BONUS_RANGE 等 2 个信号参数因维度膨胀仍锁死不寻优。
+    MAX_POSITION_PCT_RANGE: str = "0.04,0.20,0.02"
     # FIX(P1-2): 兜底值从 12 提高到 30（新寻优范围中位数 45 的保守值），
     # 防止 WFO 失败时 buy_threshold=12 导致满屏低分垃圾信号入场
     BUY_THRESHOLD: int = Field(default=30, ge=1, le=100,

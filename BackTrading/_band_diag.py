@@ -20,64 +20,11 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from BackTrading.prepare import CACHE_DIR, _REV_SIGNAL_COL_MAP  # noqa: E402
-from DataManager.DbEngine import get_engine  # noqa: E402
-from UtilsManager.ConfigParser import Config  # noqa: E402
-
-
-def _load(cache_dir: Path) -> pd.DataFrame:
-    files = sorted(p for p in cache_dir.glob("*/*.parquet"))
-    if not files:
-        files = sorted(cache_dir.glob("*.parquet"))
-    parts: list[pd.DataFrame] = []
-    for f in files:
-        try:
-            part = pd.read_parquet(f)
-        except Exception as e:  # noqa: BLE001
-            print(f"  skip {f.name}: {e}")
-            continue
-        if "exit_strategy" in part.columns:
-            part = part.drop(columns=["exit_strategy"])
-        _rn = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items()
-               if eng in part.columns and eng != chn}
-        if _rn:
-            part = part.rename(columns=_rn)
-        parts.append(part)
-        if len(parts) >= 800:
-            df = pd.concat(parts, ignore_index=True)
-            del parts[:]
-            parts.append(df)
-            gc.collect()
-    if not parts:
-        raise SystemExit("no data")
-    return pd.concat(parts, ignore_index=True)
-
-
-def _fut(df: pd.DataFrame, fwd: int) -> pd.DataFrame:
-    from sqlalchemy import text
-    syms = df["symbol"].unique().tolist()
-    SLICE = 500
-    out = None
-    for i in range(0, len(syms), SLICE):
-        batch = syms[i:i + SLICE]
-        ph = ",".join(f"'{s}'" for s in batch)
-        q = text(f"SELECT symbol, trade_date, close_normal FROM stock_daily_kline "
-                 f"WHERE symbol IN ({ph}) ORDER BY symbol, trade_date")
-        try:
-            part = pd.read_sql(q, get_engine(Config()))
-        except Exception:
-            q = text(f"SELECT symbol, trade_date, close AS close_normal FROM stock_daily_kline "
-                     f"WHERE symbol IN ({ph}) ORDER BY symbol, trade_date")
-            part = pd.read_sql(q, get_engine(Config()))
-        out = part if out is None else pd.concat([out, part], ignore_index=True)
-        del part
-        gc.collect()
-    out["trade_date"] = out["trade_date"].astype(str)
-    out = out.sort_values(["symbol", "trade_date"]).reset_index(drop=True)
-    grp = out.groupby("symbol")["close_normal"]
-    out[f"fwd_ret_{fwd}"] = (grp.shift(-fwd) / out["close_normal"]) - 1.0
-    return df.merge(out[["symbol", "trade_date", f"fwd_ret_{fwd}"]],
-                    on=["symbol", "trade_date"], how="left")
+from BackTrading.prepare import CACHE_DIR  # noqa: E402
+# 2026-11-04 方向回切防线：缓存加载/前向收益 join 统一复用 direction_audit 库函数，
+# 避免本脚本与 direction_audit.py 两份实现漂移；人工诊断入口保留在本脚本。
+from LogicAnalyzer.direction_audit import load_cache_df as _load  # noqa: E402
+from LogicAnalyzer.direction_audit import join_fwd_ret as _fut  # noqa: E402
 
 
 def main() -> None:

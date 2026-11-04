@@ -141,6 +141,7 @@ def _oos_validate(
             atr_stop_mult=params.get("atr_stop_mult", engine_cfg.atr_stop_mult),
             buy_threshold=int(params.get("buy_threshold", engine_cfg.buy_threshold)),
             max_holdings=int(params.get("max_holdings", engine_cfg.max_holdings)),
+            max_position_pct=params.get("max_position_pct", engine_cfg.max_position_pct),
         )
 
         signal_params = {k: v for k, v in params.items() if k in _SIGNAL_KEYS}
@@ -258,7 +259,10 @@ def bayesian_walk_forward_multi(
         commission_rate=kwargs.get("commission", 0.0003),
         stamp_tax_rate=kwargs.get("stamp_tax", 0.0005),
         slippage=_slip,
-        max_position_pct=kwargs.get("max_position_pct", 0.1),
+        # FIX(2026-11-04)：默认 0.10 → 0.12（与 EngineConfig dataclass 默认一致），
+        # 消除静默口径漂移——此前任何未显式传 max_position_pct 的调用会静默换口径；
+        # 常规路径由 runner 显式传 bt.MAX_POSITION_PCT，缺省仅在内部复用场景出现。
+        max_position_pct=kwargs.get("max_position_pct", 0.12),
         portfolio_method=kwargs.get("portfolio_method", "score_weighted"),
         point_in_time=kwargs.get("point_in_time", True),
         execution_model=kwargs.get("execution_model", "next_open"),

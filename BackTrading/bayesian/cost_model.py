@@ -31,9 +31,10 @@ _SIGNAL_PARAM_KEYS = frozenset({
 # EngineConfig 中可被优化的字段（必须是 EngineConfig 的 dataclass 字段）
 # 注：kelly_fraction / position_a / liq_veto_ratio / risk_none_multiplier
 # 为引擎死参数（审计确认仓位恒等权），不纳入寻优。
+# max_position_pct：2026-11-04 起纳入（组合层，等权引擎真实消费 → 影响单票权重上限）。
 _TUNABLE_CFG_FIELDS = frozenset({
     "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",
-    "buy_threshold", "max_holdings",
+    "buy_threshold", "max_holdings", "max_position_pct",
 })
 
 # ── 全局信号缓存（跨路径跨窗口共享） ──

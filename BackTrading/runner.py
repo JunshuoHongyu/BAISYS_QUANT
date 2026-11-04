@@ -685,7 +685,8 @@ def run_backtest_pipeline(
             commission_rate=bt.COMMISSION_RATE,
             stamp_tax_rate=bt.STAMP_TAX_RATE,
             slippage=bt.SLIPPAGE,
-            max_position_pct=bt.MAX_POSITION_PCT,
+            # 2026-11-04：终验用校准后单票上限（WFO 寻优输出），与组合参数一致
+            max_position_pct=best_params.get("max_position_pct", bt.MAX_POSITION_PCT),
             portfolio_method=bt.PORTFOLIO_METHOD,
             point_in_time=bt.POINT_IN_TIME,
             atr_stop_mult=best_params.get("atr_stop_mult", _sc.ATR_STOP_MULT),
@@ -1222,6 +1223,38 @@ def run_backtest_pipeline(
         cal_result.gate_passed = _gate_pass
         cal_result.gate_reasons = _gate_reasons
 
+        # ── 方向审计门控（2026-11-04 方向回切防线；建议二） ──
+        # 在写回前对信号评分做三层方向审计（L1 因子方向 / L2 候选区间形态 /
+        # L3 买入样本 IC）。🔴（≥3 因子翻转 + L2 单调性破坏）→ 强制 gate_passed=false
+        # 阻断采纳，防止 A3 式"方向搞反后贝叶斯照常上线"事故重演。
+        try:
+            from LogicAnalyzer.direction_audit import audit_direction
+
+            _direction_audit = audit_direction(
+                min_band=float(bt.BUY_THRESHOLD),
+                label=str(bt.BACKTEST_START_DATE),
+            )
+            cal_result.direction_audit = _direction_audit.to_dict()
+            if _direction_audit.verdict == "🔴":
+                logger.critical("=" * 60)
+                logger.critical(
+                    f"[方向审计] 🔴 评分方向性失效（翻转因子={_direction_audit.flipped_factors}，"
+                    f"L2 spearman={_direction_audit.l2_spearman:.2f}）→ 阻断参数采纳"
+                )
+                logger.critical("=" * 60)
+                _gate_pass = False
+                _gate_reasons.append(
+                    f"方向审计严重（L1 翻转 {len(_direction_audit.flipped_factors)} 因子 + L2 单调性破坏）"
+                )
+                cal_result.gate_passed = False
+                cal_result.gate_reasons = _gate_reasons
+            elif _direction_audit.verdict == "🟡":
+                logger.warning(
+                    f"[方向审计] 🟡 观察（不阻断，照常上线）: {'；'.join(_direction_audit.reasons)}"
+                )
+        except Exception as _dir_exc:  # 审计不可用（如无信号缓存）不阻断主流程
+            logger.warning(f"[方向审计] 审计不可用，跳过方向门控（不影响其它门控）: {_dir_exc}")
+
         # 始终写入 calibration_result.json（门控不通过时也写入，但标记 gate_passed=false）
         save_calibration(cal_result)
         if _gate_pass:
@@ -1338,6 +1371,7 @@ def run_backtest_pipeline(
             config_hash=cal_result.config_hash,
             data_version=_data_version,
             adopted=_gate_pass,
+            direction_audit=cal_result.direction_audit,
         )
 
         updated_sections = set()
@@ -1876,6 +1910,7 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
                 "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
                 "buy_threshold": bt.BUY_THRESHOLD,
                 "max_holdings": bt.MAX_HOLDINGS,
+                "max_position_pct": bt.MAX_POSITION_PCT,  # 2026-11-04 纳入校准兜底字典
             }
 
         # ── 覆盖层：上次成功校准参数（只覆盖同名键，不破坏完整参数集） ──

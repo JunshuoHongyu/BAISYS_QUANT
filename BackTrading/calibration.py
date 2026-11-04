@@ -79,6 +79,8 @@ CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "divergence_penalty": ("BACKTEST_CALIBRATED", "divergence_penalty"),
     "buy_threshold": ("BACKTEST_CALIBRATED", "buy_threshold"),
     "max_holdings": ("BACKTEST_CALIBRATED", "max_holdings"),
+    # 2026-11-04 WFO 寻优扩展：单票仓位上限（组合层，is_signal=False）
+    "max_position_pct": ("BACKTEST_CALIBRATED", "max_position_pct"),
     # ── P4 组合优化器超参数 ──
     "optimizer_risk_aversion": ("BACKTEST_CALIBRATED", "optimizer_risk_aversion"),
     "optimizer_turnover_penalty": ("BACKTEST_CALIBRATED", "optimizer_turnover_penalty"),
@@ -125,6 +127,8 @@ class CalibrationResult:
     gate_reasons: list[str] = field(default_factory=list)
     # ── 成本模型快照（方案C：回测验证假设的持久化记录）──
     cost_model_snapshot: dict[str, Any] = field(default_factory=dict)
+    # ── 方向审计快照（2026-11-04 方向回切防线；🔴 时 gate_passed=false）──
+    direction_audit: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CalibrationResult:
@@ -343,6 +347,9 @@ def _apply_params_to_config(cfg: object, overrides: dict) -> None:
             cfg.app_config.backtest.BUY_THRESHOLD = int(float(val))
         elif key == "max_holdings":
             cfg.app_config.backtest.MAX_HOLDINGS = int(float(val))
+        # 2026-11-04：单票仓位上限纳入校准闭环（WFO 寻优 → DB adopted → 复盘读取）
+        elif key == "max_position_pct":
+            cfg.app_config.backtest.MAX_POSITION_PCT = float(val)
         # 受控静态参数（Position Sizer 消费；回测引擎等权不消费）
         elif key == "kelly_fraction":
             ps.KELLY_FRACTION = float(val)

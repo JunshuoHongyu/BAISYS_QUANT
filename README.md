@@ -38,6 +38,8 @@
 - **AA 回撤调参**：`max_position_pct 0.12→0.08`（config.ini [BACKTEST]），终验 MaxDD **-41.5%→-25.8%**、Sharpe **0.25→0.29**（A3 基线 0.19），总收益 30.78%（seed 固定后可复现）。
 - **ML 可复现性修复**：XGBoost 固定 `seed=42`（LogicAnalyzer/ml/signal_model.py）。此前无 seed 导致每次 prepare 重训出不同 ML 覆写评分，同一信号+参数的回测收益在 -9.3%~+23.6% 间随机漂移，对比结论不可复现。
 - **ML 数据完整性**：XGBoost 训练链路含标签合规（fwd_5d_raw 前瞻清除）、时序切分泄露隔离（单折）、特征 T-1 窗口闭合三道自检，逐窗口 PASS 才允许覆写。
+- **max_position_pct 纳入 WFO 寻优空间**（FIX(2026-11-04)）：单票仓位上限从手工调参（AA 应急 8 轮）升级为月度自适应——搜索空间 `0.04,0.20,0.02`（9 档，当前 0.08 落带内偏下），组合层参数（is_signal=False）评估复用信号缓存秒级完成；市场高波动期 BO 自动压低上限保回撤，低迷期自动用足资金。
+- **方向审计门控（方向回切防线）**（FIX(2026-11-04)）：校准写回前自动跑三层方向审计（`LogicAnalyzer/direction_audit.py`）——L1 因子方向 IC vs 期望符号表、L2 候选区间 Q1~Q5 形态（A4 反 U 语义：Q5≥Q1 方成立）、L3 买入样本 IC；🔴（≥3 因子翻转 + L2 单调性破坏）强制 `gate_passed=false` 阻断采纳（防 A3 式"方向搞反还照常上线"），🟡 记录+告警照常上线。审计快照入 `calibration_result.json` + `backtest_calibration_log.direction_audit`。
 
 ## 📖 项目简介
 
@@ -45,7 +47,7 @@
 
 ### 阶段 A — 回测校准
 
-通过 Walk-Forward 滚动窗口优化 + 贝叶斯优化（Bayesian Optimization），自动寻优 8 个核心策略参数（5 个信号参数 + 3 个组合参数）用于日常运行。信号计算已全向量化（`numpy` + `np.select` / `np.correlate`，无 per-bar Python 循环），结合 Phase 0 指标预计算缓存与 ML 预测冻结缓存，单次信号计算 3000 只股票约 10 分钟。采用两级成本分层（信号计算分钟级 + 纯回测秒级）和 GP 代理模型（Gaussian Process + qEI 采集函数），在相同计算预算下覆盖完整参数空间。
+通过 Walk-Forward 滚动窗口优化 + 贝叶斯优化（Bayesian Optimization），自动寻优 7 个核心策略参数（3 个活跃信号参数 + 4 个组合参数，其中 `max_position_pct` 于 2026-11-04 纳入）用于日常运行。信号计算已全向量化（`numpy` + `np.select` / `np.correlate`，无 per-bar Python 循环），结合 Phase 0 指标预计算缓存与 ML 预测冻结缓存，单次信号计算 3000 只股票约 10 分钟。采用两级成本分层（信号计算分钟级 + 纯回测秒级）和 GP 代理模型（Gaussian Process + qEI 采集函数），在相同计算预算下覆盖完整参数空间。校准写回前经三层方向审计（L1 因子方向 / L2 区间形态 / L3 买入 IC）把关，方向性失效自动阻断采纳。
 
 ### 阶段 B — 每日分析管线
 
@@ -92,8 +94,9 @@
 - **机器学习信号增强** — 引入 XGBoost/Ridge 双模型（`LogicAnalyzer/ml/signal_model.py`）作为信号修偏层。以历史金叉/背离信号及量价特征为输入，输出概率校准后的信号置信度（`apply_ml_signal`），叠加到综合评分。预测结果按 (config_hash, data_fp) 冻结缓存，窗口内仅重训一次，避免重复计算。
 - **Phase 0 指标预计算缓存** — `indicator_cache.py` 在每个 WFO 窗口首次运行时预计算全部技术指标，结果写磁盘（`.indicators.parquet`）；背离峰值/谷值在 `_divergence_scores` 中滚动计算（避免未来函数 lookahead），缓存于 `.divergence.npz`。窗口内后续贝叶斯评估（信号参数变化）跳过指标复算，仅重跑评分逻辑，单次评估从 ~1 小时降至 ~5 分钟。
 - **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。OOS 默认 120 天（`out_of_sample_days` 可配置），IS 按数据长度自适应（`train_period = max(120, 总长度 - OOS - 路径数×OOS - embargo)`，embargo 必须扣减，否则末条路径必然越界跳过），多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
-- **贝叶斯优化引擎** — 4 阶段优化器：Sobol 准随机初始化 → GP+qEI 信号层搜索 → GP+qEI 组合层搜索（信号固定）→ GP 代理 L-BFGS-B 精炼 Top-3。联合寻优 8 个参数：boll_narrow_ratio, cross_decay_days, golden_cross_bonus, divergence_penalty, conclusion_full_bull（信号参数），atr_stop_mult, buy_threshold, max_holdings（组合参数）。预算可在 `config.ini [BACKTEST]` 配置（默认 12 组初始化 + 24 次信号层迭代 + 20 组初始化 + 60 次组合层迭代）
-- **两级成本分层** — 信号参数（5 个）触发完整管线（`prepare_backtest_data`，分钟级）；纯组合参数（3 个）直接从缓存加载信号（秒级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
+- **贝叶斯优化引擎** — 4 阶段优化器：Sobol 准随机初始化 → GP+qEI 信号层搜索 → GP+qEI 组合层搜索（信号固定）→ GP 代理 L-BFGS-B 精炼 Top-3。联合寻优 7 个参数：boll_narrow_ratio, cross_decay_days, conclusion_full_bull（活跃信号参数；golden_cross_bonus/divergence_penalty 因维度膨胀锁死为配置默认值），atr_stop_mult, buy_threshold, max_holdings, max_position_pct（组合参数，2026-11-04 纳入）。预算可在 `config.ini [BACKTEST]` 配置（默认 12 组初始化 + 24 次信号层迭代 + 20 组初始化 + 60 次组合层迭代）
+- **两级成本分层** — 信号参数（3 个活跃）触发完整管线（`prepare_backtest_data`，分钟级）；纯组合参数（4 个）直接从缓存加载信号（秒级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
+- **方向审计门控** — 校准写回前执行 `LogicAnalyzer/direction_audit.py` 三层方向审计：L1 因子方向 IC vs 期望符号表（9 因子）、L2 候选区间 Q1~Q5 形态（A4 反 U 语义：Q5≥Q1 方成立，秩相关容忍 -0.25）、L3 买入样本 IC（容忍 -0.05）。🔴（≥3 因子翻转 + L2 单调性破坏）→ `gate_passed=false` 强制阻断采纳；🟡（1-2 因子翻转 / L2 边缘 / L3 跌破）→ 告警观察照常上线；🟢 通过。快照持久化至 `calibration_result.json` + `backtest_calibration_log.direction_audit`（JSONB），复盘可回溯每次校准的方向健康度
 - **高斯过程代理模型** — `ConstantKernel × Matern(ARD) + WhiteKernel` 组合核，自动相关性长度尺度学习。`save_gp_state` / `restore_gp_state` 序列化核参数实现跨窗口迁移学习
 - **混合采集函数** — `Expected Improvement - λ·σ/|μ|`（DSR 惩罚项，λ=0.05），抑制高不确定性低预期区域的采样，L-BFGS-B 多起点优化
 - **性能指标** — Sharpe、Sortino、Calmar、最大回撤、VaR(95%)、CVaR(95%)、年化收益率/波动率、胜率、盈亏比、PBO（概率过拟合）、DSR（缩水 Sharpe 比）
@@ -687,6 +690,7 @@ cd BAISYS_QUANT
 | `atr_stop_mult_range` | `1.0,3.0,0.5` | ATR 止损倍数 |
 | `buy_threshold_range` | `5,30,5` | 买入评分阈值 |
 | `max_holdings_range` | `3,20,1` | 最大持仓数 |
+| `max_position_pct_range` | `0.04,0.20,0.02` | 单票仓位比例上限（2026-11-04 纳入 WFO 寻优） |
 
 ---
 
@@ -768,7 +772,8 @@ MainShareAnalysis
   │     ├── 全量回测 (run_full_backtest) — 最优参数
   │     ├── 绩效指标计算 (Sharpe/Sortino/Calmar/VaR/胜率/PBO/DSR)
   │     ├── 统一采纳门控（7 项硬门槛校验）
-  │     └── 保存校准结果 → calibration_result.json + config.ini
+  │     ├── 方向审计门控（L1 因子方向 / L2 区间形态 / L3 买入 IC；🔴 阻断采纳）
+  │     └── 保存校准结果 → calibration_result.json + backtest_calibration_log
   │
   └── [阶段 B] 每日分析管线 DAG 20 步 (StockAnalysisCoordinator)
         ├─ 01 同步历史K线 (IncrementalSyncEngine)
