@@ -395,6 +395,10 @@ class XGBSignalModel(BaseSignalModel):
                 "min_child_weight": 5,
                 "n_jobs": -1,
                 "verbosity": 0,
+                # FIX(A4-2026-11-04): 固定随机种子 — 此前缺 seed 导致每次 prepare
+                # 重训出不同 ML 覆写评分，同一信号+A4 参数的回测收益在 -9.3%~+23.6%
+                # 之间随机漂移（终验 11.7% vs AA R2 21.9%），对比结论不可复现。
+                "seed": 42,
             }
             evals = [(dtrain, "train")]
             if X_val is not None and y_val is not None and len(y_val) >= 20:
