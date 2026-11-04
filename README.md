@@ -38,8 +38,14 @@
 - **AA 回撤调参**：`max_position_pct 0.12→0.08`（config.ini [BACKTEST]），终验 MaxDD **-41.5%→-25.8%**、Sharpe **0.25→0.29**（A3 基线 0.19），总收益 30.78%（seed 固定后可复现）。
 - **ML 可复现性修复**：XGBoost 固定 `seed=42`（LogicAnalyzer/ml/signal_model.py）。此前无 seed 导致每次 prepare 重训出不同 ML 覆写评分，同一信号+参数的回测收益在 -9.3%~+23.6% 间随机漂移，对比结论不可复现。
 - **ML 数据完整性**：XGBoost 训练链路含标签合规（fwd_5d_raw 前瞻清除）、时序切分泄露隔离（单折）、特征 T-1 窗口闭合三道自检，逐窗口 PASS 才允许覆写。
-- **max_position_pct 纳入 WFO 寻优空间**（FIX(2026-11-04)）：单票仓位上限从手工调参（AA 应急 8 轮）升级为月度自适应——搜索空间 `0.04,0.20,0.02`（9 档，当前 0.08 落带内偏下），组合层参数（is_signal=False）评估复用信号缓存秒级完成；市场高波动期 BO 自动压低上限保回撤，低迷期自动用足资金。
+- **max_position_pct 纳入 WFO 寻优空间**（FIX(2026-11-04)，⚠️ 已于 2026-11-05 撤销，见下条"多阶段解耦寻优"）：单票仓位上限从手工调参（AA 应急 8 轮）升级为月度自适应——搜索空间 `0.04,0.20,0.02`（9 档，当前 0.08 落带内偏下），组合层参数（is_signal=False）评估复用信号缓存秒级完成；市场高波动期 BO 自动压低上限保回撤，低迷期自动用足资金。
 - **方向审计门控（方向回切防线）**（FIX(2026-11-04)）：校准写回前自动跑三层方向审计（`LogicAnalyzer/direction_audit.py`）——L1 因子方向 IC vs 期望符号表、L2 候选区间 Q1~Q5 形态（A4 反 U 语义：Q5≥Q1 方成立）、L3 买入样本 IC；🔴（≥3 因子翻转 + L2 单调性破坏）强制 `gate_passed=false` 阻断采纳（防 A3 式"方向搞反还照常上线"），🟡 记录+告警照常上线。审计快照入 `calibration_result.json` + `backtest_calibration_log.direction_audit`。
+- **多阶段解耦寻优（消灭 PBO 过拟合）**（FIX(2026-11-05) 用户审计）：原 7/8 维联合贝叶斯寻优在 ~119 次试验下 GP 拟合曲面不置信 → 最优解落入历史噪音"孤立尖峰"（PBO 曾达 1.0）。重构为**先控风控风险，后锁信号常数**：
+  - **第一步（降维）**：贝叶斯只寻优 3 维组合风控 `{atr_stop_mult, buy_threshold, max_holdings}`（`_ACTIVE_RANGE_ATTRS` 收口，`BackTrading/bayesian/space.py`）；5 个信号参数（boll_narrow_ratio=0.9 / cross_decay_days=30 / conclusion_full_bull=80 / golden_cross_bonus=10 / divergence_penalty=20）与 `max_position_pct=0.08` 锚定为静态生产常数（config.ini `[REGIME_DETECTION]` / `[FULL_BULL_SCORING]` / `[SCORING_PARAMS]` 显式声明，`_FIXED_PARAMS` 同步锁定），评估链与生产同口径。
+  - **第二步（信号层参数平原）**：信号参数微调不再走 BO，改离线**参数平原扫描**（`BackTrading/_signal_plateau_scan.py`）：粗粒度网格（默认 7×4=28 点）遍历 cross_decay_days × conclusion_full_bull，每个网格点真实回测得 Sharpe 平面，取**夏普连片区域的最大连通域几何中心**（不追历史最高点）作静态生产参数写入 config.ini。
+  - **刚性熔断**：采纳门控任一硬门槛不过（PBO>0.05 / DSR<0.5 / OOS 衰减 / 显著性 / 稳健性任一失败）→ `critical` 熔断日志 + `adopted=false`，本次校准作废，复盘自动沿用上一期已采纳参数 / 出厂兜底（`fallback_params.py`）。
+- **获利因子等盈亏口径审计**（FIX(2026-11-05) 用户审计）：排查"总收益 +19.28% 但 PF≈0.17"类矛盾——① 撮合层**成交才记账**（挂单队列不入 cash/positions，20 日重挂/无限重挂不产生虚拟扣款重复累加）；② 价格口径核对：成交/现金/费用统一在**不复权真实价**空间（`_exec_price_for` 基于 close_raw），持仓市值按**后复权**收盘估值（跨除权日连续），除权日附近仅"持有头寸"存在复权等价盯市差异（口径选择，非重复扣款/基准换算 bug），涨跌停模型用不复权价（P0-8 已修）；③ 修复真实口径 bug x2：`profit_factor` 计算此前只扣买入费用、**漏扣卖出费用**（`LogicAnalyzer/backtest_metrics.py` 现按成交量分摊扣 `sells[].cost`，并兼容引擎 `qty` 键）；同一买入被多笔部分卖出消耗时，成本分摊由"写回剩余股数→重复扣整笔成本"改为**相对原始买入股数**（实测修复前部分卖单 PF 0.115 → 修复后 inf）。输出 buy/sell 费用汇总字段；④ 新增 `BackTrading/_pf_audit.py` 审计工具（`--live` 现场同源重跑校验"已实现+未实现=权益增量"守恒，离线审计 DB 旧产物）。
+- **强制开启 exclude_st（生产风控）**（FIX(2026-11-05) 用户审计）：config.ini `[BACKTEST] exclude_st=true` 从"被 runner 硬编码 False 覆盖"改为**runner 读配置驱动**（`BackTrading/runner.py` 两处），回测/寻优/终验/复盘全链路同口径剔除 ST/退市整理股，杜绝 ST 脱帽幸存者偏差与实盘流动性枯竭风险；原 FIX(P0) train/serve skew 决策废止。
 
 ## 📖 项目简介
 
@@ -47,7 +53,7 @@
 
 ### 阶段 A — 回测校准
 
-通过 Walk-Forward 滚动窗口优化 + 贝叶斯优化（Bayesian Optimization），自动寻优 7 个核心策略参数（3 个活跃信号参数 + 4 个组合参数，其中 `max_position_pct` 于 2026-11-04 纳入）用于日常运行。信号计算已全向量化（`numpy` + `np.select` / `np.correlate`，无 per-bar Python 循环），结合 Phase 0 指标预计算缓存与 ML 预测冻结缓存，单次信号计算 3000 只股票约 10 分钟。采用两级成本分层（信号计算分钟级 + 纯回测秒级）和 GP 代理模型（Gaussian Process + qEI 采集函数），在相同计算预算下覆盖完整参数空间。校准写回前经三层方向审计（L1 因子方向 / L2 区间形态 / L3 买入 IC）把关，方向性失效自动阻断采纳。
+通过 Walk-Forward 滚动窗口优化 + 贝叶斯优化（Bayesian Optimization），自动寻优 3 维组合风控参数（`atr_stop_mult / buy_threshold / max_holdings`；2026-11-05 多阶段解耦重构后信号层与仓位上限不再进入 BO，见"近期校准更新"）用于日常运行。信号计算已全向量化（`numpy` + `np.select` / `np.correlate`，无 per-bar Python 循环），结合 Phase 0 指标预计算缓存与 ML 预测冻结缓存，单次信号计算 3000 只股票约 10 分钟。采用两级成本分层（信号计算分钟级 + 纯回测秒级）和 GP 代理模型（Gaussian Process + qEI 采集函数），在相同计算预算下覆盖完整参数空间。校准写回前经三层方向审计（L1 因子方向 / L2 区间形态 / L3 买入 IC）把关，方向性失效自动阻断采纳；采纳硬门槛任一不过即熔断本次校准（沿用上一期已采纳参数 / 出厂兜底）。
 
 ### 阶段 B — 每日分析管线
 
@@ -92,19 +98,19 @@
 
 - **全向量化信号引擎** — 信号计算已从 per-bar 逐行 Python 循环重构为纯 numpy 向量化运算。`compute_signals()` 使用 `np.where`、`np.correlate`、`np.select`、前缀和、rolling window broadcast 等技术，消除所有逐行 Python 回调。次核心指标（MACD/BOLL/KDJ/RSI/CCI/ADX）在 Phase 0 预计算阶段一次性完成，后续所有参数评估直接复用。
 - **机器学习信号增强** — 引入 XGBoost/Ridge 双模型（`LogicAnalyzer/ml/signal_model.py`）作为信号修偏层。以历史金叉/背离信号及量价特征为输入，输出概率校准后的信号置信度（`apply_ml_signal`），叠加到综合评分。预测结果按 (config_hash, data_fp) 冻结缓存，窗口内仅重训一次，避免重复计算。
-- **Phase 0 指标预计算缓存** — `indicator_cache.py` 在每个 WFO 窗口首次运行时预计算全部技术指标，结果写磁盘（`.indicators.parquet`）；背离峰值/谷值在 `_divergence_scores` 中滚动计算（避免未来函数 lookahead），缓存于 `.divergence.npz`。窗口内后续贝叶斯评估（信号参数变化）跳过指标复算，仅重跑评分逻辑，单次评估从 ~1 小时降至 ~5 分钟。
+- **Phase 0 指标预计算缓存** — `indicator_cache.py` 在每个 WFO 窗口首次运行时预计算全部技术指标，结果写磁盘（`.indicators.parquet`）；背离峰值/谷值在 `_divergence_scores` 中滚动计算（避免未来函数 lookahead），缓存于 `.divergence.npz`。窗口内后续贝叶斯评估（组合参数变化）跳过指标复算，仅重跑评分逻辑，单次评估从 ~1 小时降至 ~5 分钟。
 - **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。OOS 默认 120 天（`out_of_sample_days` 可配置），IS 按数据长度自适应（`train_period = max(120, 总长度 - OOS - 路径数×OOS - embargo)`，embargo 必须扣减，否则末条路径必然越界跳过），多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
-- **贝叶斯优化引擎** — 4 阶段优化器：Sobol 准随机初始化 → GP+qEI 信号层搜索 → GP+qEI 组合层搜索（信号固定）→ GP 代理 L-BFGS-B 精炼 Top-3。联合寻优 7 个参数：boll_narrow_ratio, cross_decay_days, conclusion_full_bull（活跃信号参数；golden_cross_bonus/divergence_penalty 因维度膨胀锁死为配置默认值），atr_stop_mult, buy_threshold, max_holdings, max_position_pct（组合参数，2026-11-04 纳入）。预算可在 `config.ini [BACKTEST]` 配置（默认 12 组初始化 + 24 次信号层迭代 + 20 组初始化 + 60 次组合层迭代）
-- **两级成本分层** — 信号参数（3 个活跃）触发完整管线（`prepare_backtest_data`，分钟级）；纯组合参数（4 个）直接从缓存加载信号（秒级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
+- **贝叶斯优化引擎（组合层降维版）** — 4 阶段优化器：Sobol 准随机初始化 → GP+qEI 组合层搜索 → GP 代理 L-BFGS-B 精炼 Top-3 → 模拟验证。寻优空间 3 维组合风控：atr_stop_mult, buy_threshold, max_holdings（`BackTrading/bayesian/space.py` `_ACTIVE_RANGE_ATTRS` 收口）；boll_narrow_ratio / cross_decay_days / conclusion_full_bull / golden_cross_bonus / divergence_penalty 五个信号参数与 max_position_pct 为静态生产常数（`_FIXED_PARAMS` 锁定，信号微调走 `_signal_plateau_scan.py` 参数平原扫描而非 BO）。预算可在 `config.ini [BACKTEST]` 配置（默认 20 组初始化 + 60 次组合层迭代）
+- **两级成本分层** — 组合参数（3 个活跃）评估直接从缓存加载信号（秒级），仅当信号层常数变更时才触发完整管线（`prepare_backtest_data`，分钟级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
 - **方向审计门控** — 校准写回前执行 `LogicAnalyzer/direction_audit.py` 三层方向审计：L1 因子方向 IC vs 期望符号表（9 因子）、L2 候选区间 Q1~Q5 形态（A4 反 U 语义：Q5≥Q1 方成立，秩相关容忍 -0.25）、L3 买入样本 IC（容忍 -0.05）。🔴（≥3 因子翻转 + L2 单调性破坏）→ `gate_passed=false` 强制阻断采纳；🟡（1-2 因子翻转 / L2 边缘 / L3 跌破）→ 告警观察照常上线；🟢 通过。快照持久化至 `calibration_result.json` + `backtest_calibration_log.direction_audit`（JSONB），复盘可回溯每次校准的方向健康度
 - **高斯过程代理模型** — `ConstantKernel × Matern(ARD) + WhiteKernel` 组合核，自动相关性长度尺度学习。`save_gp_state` / `restore_gp_state` 序列化核参数实现跨窗口迁移学习
 - **混合采集函数** — `Expected Improvement - λ·σ/|μ|`（DSR 惩罚项，λ=0.05），抑制高不确定性低预期区域的采样，L-BFGS-B 多起点优化
-- **性能指标** — Sharpe、Sortino、Calmar、最大回撤、VaR(95%)、CVaR(95%)、年化收益率/波动率、胜率、盈亏比、PBO（概率过拟合）、DSR（缩水 Sharpe 比）
+- **性能指标** — Sharpe、Sortino、Calmar、最大回撤、VaR(95%)、CVaR(95%)、年化收益率/波动率、胜率、盈亏比（profit_factor，2026-11-05 修复：卖出费用已扣、部分卖出成本按原始买入股数分摊）、PBO（概率过拟合）、DSR（缩水 Sharpe 比）
 - **仓位分配** — 引擎执行 Top-K 评分等权分配（`core.py`），候选按综合评分排序后等权买入，遵守单票上限/行业暴露约束
 - **校准持久化** — 最优参数由门控通过后写入数据库 `backtest_calibration_log`（`adopted=true`），复盘单元从数据库读取；`config.ini` 只保存用户输入参数，不含回测↔复盘通信数据；无已采纳记录时自动使用出厂兜底参数（`BackTrading/fallback_params.py`，数据库镜像表 `backtest_fallback_params` 启动自愈不可删除）
 - **信号预计算缓存** — `prepare_backtest_data()` 按 `signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/{bucket}/{symbol}.parquet` 增量写入（`data_fp` 为数据指纹，用于 WFO 窗口切片隔离），分桶减小单目录文件数，断点自动续算。Phase 0 缓存位于 `CACHE_DIR/indicator_cache_v1/<bucket>/<symbol>.indicators.parquet`，线程间通过磁盘共享。
 - **独立验证集模拟验证** — WFO 选参后优先使用与选参区间**无交集**的 holdout 独立验证集（默认 `holdout_ratio=0.20`，全程禁触）做 Sharpe/Sortino 衰减校验（衰减 >30% 拒绝上线），替代旧的自引用"最近 N 日"验证；独立验证集未提供时回退并告警
-- **过拟合防护体系** — CPCV 净化 + 禁运（purge 5 天 / embargo 3 天剔除训练窗口重叠样本）、Diebold-Mariano (DM) 检验（Newey-West HAC，仅采纳 DM 显著窗口参数）、多重测试惩罚（同区间调参超 10 次 Sharpe/Sortino 扣 20%，超 30 次判失效）、参数稳健性自检（Sharpe>2 时最优参数 ±10% 扰动验证）、统一采纳门控（模拟验证 / OOS 衰减 / 多重测试 / 统计显著性 / 参数稳健性 / PBO≤5% / DSR≥50% 七项硬门槛，任一不过则不写入校准结果）
+- **过拟合防护体系** — CPCV 净化 + 禁运（purge 5 天 / embargo 3 天剔除训练窗口重叠样本）、Diebold-Mariano (DM) 检验（Newey-West HAC，仅采纳 DM 显著窗口参数）、多重测试惩罚（同区间调参超 10 次 Sharpe/Sortino 扣 20%，超 30 次判失效）、参数稳健性自检（Sharpe>2 时最优参数 ±10% 扰动验证）、统一采纳门控（模拟验证 / OOS 衰减 / 多重测试 / 统计显著性 / 参数稳健性 / PBO≤5% / DSR≥50% 七项硬门槛，任一不过则不写入校准结果）。2026-11-05 起：任一硬门槛不过 → `critical` 熔断日志 + 本次校准作废（不写 `adopted=true`），复盘自动沿用上一期已采纳参数 / 出厂兜底；信号层调参改参数平原扫描（取夏普连片区域质心，不追历史尖峰），从源头消除低样本维度膨胀
 - **WFO 可靠性保障** — 时间预算熔断（默认 8 小时）+ 连续无改进早停（3 个窗口）、系统性失败拦截（连续 3 窗口 OOS 失效即中断流水线）、四方绑定调度（数据版本 + 配置哈希 + 频率 + 时间）、失败快照持久化（保留 14 天）、窗口预检（RELAX/OK/SKIP/LOW_CONFIDENCE/NEED_FILL 多档）+ 指标降级缩窗重算
 
 ### 真实价格体系
@@ -635,7 +641,7 @@ cd BAISYS_QUANT
 | `out_of_sample_days` | `120` | Walk-Forward 样本外窗口天数 |
 | `holdout_ratio` | `0.20` | holdout 独立验证集比例（全程禁触） |
 | `wfo_num_paths` | `3` | Walk-Forward 多路径数 |
-| `exclude_st` | `true` | 是否剔除 ST/退市整理股 |
+| `exclude_st` | `true` | 是否剔除 ST/退市整理股（2026-11-05 起 runner 读配置驱动，回测/寻优/终验/复盘全链路同口径） |
 | `initial_cash` | `1000000` | 初始资金 |
 | `signal_pipelines` | `6` | 信号预计算并行管道数 |
 | `execution_model` | `next_open` | 成交时点模型：`next_open` 信号次日开盘成交（默认，符合A股T+1）/ `vwap` 信号次日VWAP成交 |
@@ -878,6 +884,8 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 | `KDJ_Signal.py` | 从 `app_stock_strategy_report` 筛选 KDJ 信号并验证信号日后股价表现 |
 | `MacdZeroAxisPattern.py` | 全市场 MACD"零轴完整反弹形态"扫描 |
 | `StockNewsQuery.py` | 东方财富个股新闻批量查询导出 |
+| `_signal_plateau_scan.py` | 信号层参数平原扫描（BackTrading/）：网格回测得 Sharpe 平面，取最大连通域几何中心作静态生产参数，替代 BO 微观调参 |
+| `_pf_audit.py` | 获利因子等盈亏口径审计（BackTrading/）：`--live` 现场同源重跑校验"已实现+未实现=权益增量"守恒 / 无参离线审计 DB 旧产物 |
 
 <br />
 

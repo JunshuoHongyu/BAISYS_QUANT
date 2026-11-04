@@ -570,7 +570,7 @@ def run_backtest_pipeline(
                 show_progress=True,
                 backtest_start_date=_bt_start_iso,
                 st_history=st_history,
-                exclude_st=False,  # FIX(P0): 回测不排除 ST，防止 train/serve skew
+                exclude_st=bool(getattr(bt, "EXCLUDE_ST", True)),  # 2026-11-04 生产风控：配置强制剔除 ST（config.ini [BACKTEST] exclude_st=true，勿改回 False）
                 # 复盘单元的 ST 过滤已在 Review/coordinator.py 硬编码执行（不复归 config 控制），
                 # 回测时排除 ST 会导致模型在"干净"样本池训练 → OOS 失效。
                 listing_days=listing_days,
@@ -660,9 +660,7 @@ def run_backtest_pipeline(
 
         # ST/退市逐日数据注入（引擎按 params 消费，WFO 已同口径）
         best_params["_st_history"] = st_history
-        best_params["_exclude_st"] = False  # FIX(P0): 回测不排除 ST，防止 train/serve skew
-        #   ST 过滤已在复盘单元（Review/coordinator.py）硬编码执行（不复归 config 控制）
-        #   回测时排除 ST → 模型在"干净"样本池训练 → 生产含 ST → OOS 失效（过拟合）
+        best_params["_exclude_st"] = bool(getattr(bt, "EXCLUDE_ST", True))  # 2026-11-04 生产风控：配置强制剔除 ST（config.ini exclude_st=true，用户审计推翻原 FIX(P0) 决定）
         if listing_days:
             best_params["_listing_days"] = listing_days
 
@@ -1260,13 +1258,22 @@ def run_backtest_pipeline(
         if _gate_pass:
             logger.info("[采纳门控] 参数组通过统一采纳门控，calibration_result.json 已保存")
         else:
-            logger.warning("=" * 50)
-            logger.warning(
-                "[采纳门控] 参数组未通过统一采纳门控，calibration_result.json 已保存"
-                "（gate_passed=false，请关注过拟合风险）: "
-                + "；".join(_gate_reasons)
+            # 2026-11-04 熔断强化（用户审计建议一）：PBO>0.05 或 DSR<0.5 等任一硬门槛不通过
+            # → 文件保留快照（gate_passed=false），但回测→复盘通道 record_run(adopted=false)，
+            # 复盘自动沿用上一期 adopted 参数 / 出厂兜底 fallback_params，本次校准结果作废。
+            logger.critical("=" * 60)
+            logger.critical(
+                f"[熔断] 校准结果被拒绝采纳（gate_passed=false，adopted=false）——"
+                f"本次校准一并作废，生产复盘将自动沿用上一期已采纳的稳定参数组合"
+                f"（无上一期时走出厂兜底）。原因: " + "；".join(_gate_reasons)
             )
-            logger.warning("=" * 50)
+            logger.critical(
+                f"[熔断] 关键指标: PBO={pbo:.4f}(≤0.05 通过) | DSR={dsr:.4f}(≥0.5 通过) | "
+                f"OOS衰减={'通过' if _oos_decay_pass else '不通过'} | "
+                f"显著性={'通过' if _sig_pass else '不通过'} | "
+                f"稳健性={'通过' if _robust_pass else '不通过'}"
+            )
+            logger.critical("=" * 60)
 
         # ── 回测完整性自检（AUDIT_FIX P0-4 替代方案） ──
         try:

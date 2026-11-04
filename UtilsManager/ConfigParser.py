@@ -439,6 +439,12 @@ class BacktestConfig(BaseModel):
                                  description="成交时点模型: next_open 信号次日开盘成交（默认，符合A股T+1）/ vwap 信号次日VWAP成交")
     SIGNAL_PIPELINES: int = Field(default=3, ge=1, le=8)
     WFO_NUM_PATHS: int = Field(default=3, ge=1, le=10)
+    # 2026-11-04 生产风控（用户审计）：回测宇宙剔除 ST/*ST 风险警示股，永久锁死强制开启。
+    # 注意：此前的 FIX(P0) 硬编码 exclude_st=False（防 train/serve skew）已被用户决策推翻——
+    # ST 股历史暴涨脱帽存在幸存者偏差且实盘流动性易瞬间枯竭，剔除后方可保证选股池
+    # 在生产环境 100% 真实可执行。WFO/寻优/终验/复盘全部经 runner 读此配置保持一致。
+    EXCLUDE_ST: bool = Field(default=True,
+                             description="回测宇宙剔除 ST/*ST（生产风控强制开启，勿关）")
 
     # 贝叶斯优化预算
     BAYESIAN_N_INIT_SIGNAL: int = Field(default=15, ge=5, le=50)

@@ -122,23 +122,39 @@ _SIGNAL_PARAMS: set[str] = {
 
 # 以下参数经敏感性分析对 OOS 绩效影响微小，但显著膨胀搜索空间维度（10→6 维）。
 # GP 在 10 维空间需 ~1024 个观测点才能充分覆盖，实际只有 ~350 次评估。
+#
+# 2026-11-04 解耦寻优（FIX(2026-11-04) 多阶段解耦，消灭 8 维联合寻优）：
+#   用户审计指出 119 次试验在 7~8 维连续空间中极度稀疏 → GP 拟合曲面不置信 →
+#   BO 捕捉历史噪音的"孤立尖峰" → PBO=1.0 全面过拟合。
+#   修复：贝叶斯只全力寻优 3 维组合风控（atr_stop_mult / buy_threshold / max_holdings），
+#   5 个信号参数（boll_narrow_ratio / cross_decay_days / conclusion_full_bull /
+#   golden_cross_bonus / divergence_penalty）锚定为无偏市场常数（Value = Config 锚定值，
+#   见 config.ini [REGIME_DETECTION] boll_narrow_ratio=0.9 等），单票仓位上限
+#   max_position_pct 也退出寻优（固定 0.08，DB 校准闭环保留，需要时可一行加回）。
+#   信号层微调改为离线"参数平原扫描"（BackTrading/_signal_plateau_scan.py）：
+#   粗粒度网格遍历取夏普连片区域的几何中心点，不追历史收益最高点。
 _FIXED_PARAMS: dict[str, tuple[float, str]] = {
     # (固定值, fixed_reason)
     "optimizer_cov_lookback": (120.0, "协方差估计窗口，固定为 120 交易日（~6 个月），敏感性可忽略"),
     "optimizer_risk_aversion": (0.5, "风险厌恶系数 0.5 中等风险偏好，对 Sharpe 影响 <2%"),
     "optimizer_turnover_penalty": (0.01, "换手惩罚 0.01 已足够抑制频繁交易，继续优化收益递减"),
     "optimizer_max_weight": (0.15, "单只上限 15% 为合理分散水平，>15% 集中风险与 Sharpe 无显著关系"),
+    # ── 信号层锚定常数（2026-11-04 解耦寻优；值必须与 Config 锚定值一致）──
+    "boll_narrow_ratio": (0.9, "信号层锚定：布林带窄幅比 0.9（用户建议无偏市场常数；配置见 [REGIME_DETECTION]）"),
+    "cross_decay_days": (30.0, "信号层锚定：金叉衰减天数 30（对齐 A 股月频持仓周期）"),
+    "conclusion_full_bull": (80.0, "信号层锚定：主升浪门槛 80 分"),
+    "golden_cross_bonus": (10.0, "信号层锚定：金叉奖励 10 分"),
+    "divergence_penalty": (20.0, "信号层锚定：背离惩罚 20 分"),
+    # ── 仓位层固定（退出寻优，DB 闭环保留）──
+    "max_position_pct": (0.08, "单票仓位上限固定 0.08（AA 回撤调参结果；需重新纳入寻优时从 _ACTIVE_RANGE_ATTRS 加回一行）"),
 }
 
 # _RANGE_TO_PARAM 去掉固定的参数后的搜索参数
+# 2026-11-04：仅保留 3 维组合风控（ATR 止损 / 买入阈值 / 最大持仓）
 _ACTIVE_RANGE_ATTRS = [
     "ATR_STOP_MULT_RANGE",
-    "BOLL_NARROW_RATIO_RANGE",
-    "CROSS_DECAY_DAYS_RANGE",
-    "CONCLUSION_FULL_BULL_RANGE",
     "BUY_THRESHOLD_RANGE",
     "MAX_HOLDINGS_RANGE",
-    "MAX_POSITION_PCT_RANGE",  # 2026-11-04 单票仓位上限纳入 WFO 寻优
 ]
 
 
@@ -169,10 +185,9 @@ def build_spaces(
         config_sources.append(portfolio_optimizer_config)
 
     # 只解析活跃参数的 RANGE（跳过 _FIXED_PARAMS 中的参数）
+    # 2026-11-04 解耦寻优：仅 3 维组合风控；信号层与 max_position_pct 走 _FIXED_PARAMS
     active_param_names = {
-        "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",
-        "conclusion_full_bull", "buy_threshold", "max_holdings",
-        "max_position_pct",  # 2026-11-04 组合层参数（is_signal=False → portfolio 阶段秒级评估）
+        "atr_stop_mult", "buy_threshold", "max_holdings",
     }
     range_attr_map = {
         k: v for k, v in _RANGE_TO_PARAM.items()

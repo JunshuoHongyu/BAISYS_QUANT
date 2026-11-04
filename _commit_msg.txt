@@ -1,0 +1,26 @@
+﻿FIX(2026-11-05) 多阶段解耦寻优+盈亏口径审计+强制exclude_st+README
+
+多阶段解耦寻优（消灭 PBO 过拟合，用户审计）：
+- space.py：贝叶斯寻优降维至 3 维组合风控（atr_stop_mult/buy_threshold/max_holdings，
+  _ACTIVE_RANGE_ATTRS 收口）；5 个信号参数 + max_position_pct 进 _FIXED_PARAMS 锚定
+  （boll 0.9/cross 30/conclusion 80/golden 10/divergence 20/pos 0.08），评估链与生产同口径
+- 新增 BackTrading/_signal_plateau_scan.py：信号层参数平原扫描（网格回测 Sharpe 平面，
+  取最大连通域几何中心作静态生产参数，不追历史尖峰）
+- config.ini：显式声明锚定值（REGIME_DETECTION boll=0.9 / FULL_BULL_SCORING
+  conclusion=80 / cross_decay_days=30）+ 注释废弃 RANGE 用途
+- 熔断语义强化：采纳门控任一不过 → critical + adopted=false 沿用上一期参数/兜底
+
+盈亏口径审计（用户审计"总收益正但 PF 低"）：
+- 核实：成交/现金/费用在不复权真实价空间（_exec_price_for 基于 close_raw），
+  持仓市值后复权估值；撮合层成交才记账无重复扣款
+- backtest_metrics.py：profit_factor 漏扣卖出费用修复（扣 sells[].cost）+
+  qty 键兼容引擎 trade_log + 修复部分卖出成本重复扣减
+  （分摊相对原始买入股数；实测 PF 0.115 → inf）
+- 新增 BackTrading/_pf_audit.py：盈亏守恒审计（--live 现场同源重跑 / 离线 DB 审计）
+
+强制开启 exclude_st（生产风控）：
+- runner.py 取消硬编码 False 覆盖，读 config 驱动；回测/寻优/终验/复盘全链路同口径
+- ConfigParser.BacktestConfig 新增 EXCLUDE_ST 字段（默认 true）
+
+README：近期校准更新 4 条 + 阶段A/优化引擎/两级分层/过拟合防护/性能指标/
+exclude_st 参数表/工具集同步更新；max_position_pct 纳入寻优条目标注撤销

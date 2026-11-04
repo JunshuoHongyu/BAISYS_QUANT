@@ -136,6 +136,14 @@ def compute_risk_metrics(
     }
 
 
+def _qty(t: dict[str, Any]) -> float:
+    """兼容引擎 trade_log 的 qty 键与旧 shares 键（FIX(2026-11-05) qty 字段名对齐）。"""
+    v = t.get("shares")
+    if v is None:
+        v = t.get("qty", 0)
+    return float(v or 0)
+
+
 def compute_trade_metrics(trade_log: list[dict[str, Any]]) -> dict[str, Any]:
     buys = [t for t in trade_log if t.get("action") == "buy"]
     sells = [t for t in trade_log if t.get("action", "").startswith("sell")]
@@ -153,30 +161,50 @@ def compute_trade_metrics(trade_log: list[dict[str, Any]]) -> dict[str, Any]:
         buy_queue.setdefault(b["symbol"], []).append(b)
 
     pnl = []
+    buy_fees_total = 0.0
+    sell_fees_total = 0.0
+    for b in buys:
+        buy_fees_total += float(b.get("cost", 0) or 0)
+    # FIX(2026-11-05)：部分卖出多次消耗同一买入时，成本分摊须相对"原始买入股数"。
+    # 旧实现写回 b["shares"]（剩余）后 frac 相对剩余 → 同一 buy 的 value/cost 被重复扣减，
+    # 使后续部分卖单 PnL 虚亏、PF 虚低（实测 PF 0.1148 → 应为 inf）。
+    consumed: dict[int, float] = defaultdict(float)
     for s in sells:
         sym = s["symbol"]
-        shares = float(s.get("shares", 0))
+        shares = _qty(s)
+        # 2026-11-04 审计修复（profit_factor 口径分裂）：卖出记录带 cost（佣金+印花税+滑点），
+        # 旧实现只扣买入 cost，卖出的 proceeds 用毛额 → 净利润/PF 被系统性高估。
+        # 修复：每笔卖出费用按成交量比例从 proceeds 中扣除（部分卖出时分摊）。
         proceeds = float(s.get("value", 0))
+        sell_fee = float(s.get("cost", 0) or 0)
+        sell_fees_total += sell_fee
         q = buy_queue.get(sym)
         if not q:
             continue
         if shares <= 0:
             # 旧日志无 shares 字段：退化为整笔配对
             b = q.pop(0)
-            pnl.append(proceeds - b.get("value", 0) - b.get("cost", 0))
+            pnl.append(proceeds - sell_fee - b.get("value", 0) - b.get("cost", 0))
             continue
         remaining = shares
         while remaining > 1e-9 and q:
             b = q[0]
-            b_sh = float(b.get("shares", shares))
-            take = min(remaining, b_sh)
-            frac = take / b_sh if b_sh > 0 else 1.0
-            pnl.append(proceeds * (take / shares) - b.get("value", 0) * frac - b.get("cost", 0) * frac)
+            b_sh = _qty(b)
+            bid = id(b)
+            b_consumed = consumed.get(bid, 0.0)
+            avail = b_sh - b_consumed
+            take = min(remaining, avail)
+            frac = take / b_sh if b_sh > 0 else 0.0
+            pnl.append(
+                proceeds * (take / shares)
+                - sell_fee * (take / shares)
+                - b.get("value", 0) * frac
+                - b.get("cost", 0) * frac
+            )
             remaining -= take
-            if b_sh - take <= 1e-9:
+            consumed[bid] = b_consumed + take
+            if b_consumed + take >= b_sh - 1e-9:
                 q.pop(0)
-            else:
-                b["shares"] = b_sh - take
 
     wins = [p for p in pnl if p > 0]
     losses = [p for p in pnl if p <= 0]
@@ -195,4 +223,7 @@ def compute_trade_metrics(trade_log: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_loss": round(float(avg_loss), 4),
         "profit_factor": round(float(profit_factor), 4),
         "total_pnl": round(float(sum(pnl)), 2),
+        # 2026-11-04 审计增强：费用汇总（供"已实现盈亏 vs 权益变动"守恒审计）
+        "buy_fees_total": round(buy_fees_total, 2),
+        "sell_fees_total": round(sell_fees_total, 2),
     }
