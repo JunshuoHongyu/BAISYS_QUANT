@@ -98,7 +98,7 @@
 - **混合采集函数** — `Expected Improvement - λ·σ/|μ|`（DSR 惩罚项，λ=0.05），抑制高不确定性低预期区域的采样，L-BFGS-B 多起点优化
 - **性能指标** — Sharpe、Sortino、Calmar、最大回撤、VaR(95%)、CVaR(95%)、年化收益率/波动率、胜率、盈亏比、PBO（概率过拟合）、DSR（缩水 Sharpe 比）
 - **仓位分配** — 引擎执行 Top-K 评分等权分配（`core.py`），候选按综合评分排序后等权买入，遵守单票上限/行业暴露约束
-- **校准持久化** — 最优参数自动写入 `config.ini [BACKTEST_CALIBRATED]` 分区，回测日志记录到 `backtest_calibration_log` 表
+- **校准持久化** — 最优参数由门控通过后写入数据库 `backtest_calibration_log`（`adopted=true`），复盘单元从数据库读取；`config.ini` 只保存用户输入参数，不含回测↔复盘通信数据；无已采纳记录时自动使用出厂兜底参数（`BackTrading/fallback_params.py`，数据库镜像表 `backtest_fallback_params` 启动自愈不可删除）
 - **信号预计算缓存** — `prepare_backtest_data()` 按 `signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/{bucket}/{symbol}.parquet` 增量写入（`data_fp` 为数据指纹，用于 WFO 窗口切片隔离），分桶减小单目录文件数，断点自动续算。Phase 0 缓存位于 `CACHE_DIR/indicator_cache_v1/<bucket>/<symbol>.indicators.parquet`，线程间通过磁盘共享。
 - **独立验证集模拟验证** — WFO 选参后优先使用与选参区间**无交集**的 holdout 独立验证集（默认 `holdout_ratio=0.20`，全程禁触）做 Sharpe/Sortino 衰减校验（衰减 >30% 拒绝上线），替代旧的自引用"最近 N 日"验证；独立验证集未提供时回退并告警
 - **过拟合防护体系** — CPCV 净化 + 禁运（purge 5 天 / embargo 3 天剔除训练窗口重叠样本）、Diebold-Mariano (DM) 检验（Newey-West HAC，仅采纳 DM 显著窗口参数）、多重测试惩罚（同区间调参超 10 次 Sharpe/Sortino 扣 20%，超 30 次判失效）、参数稳健性自检（Sharpe>2 时最优参数 ±10% 扰动验证）、统一采纳门控（模拟验证 / OOS 衰减 / 多重测试 / 统计显著性 / 参数稳健性 / PBO≤5% / DSR≥50% 七项硬门槛，任一不过则不写入校准结果）
@@ -239,10 +239,6 @@ fund_flow_periods = 3,5,10        ; 短期资金流（仅允许 3,5,10 / 3,5,20 
 
 [FILTER_RULES]
 exempt_levels = 完全主升,趋势加速   ; 仅保留强势股
-
-[BACKTEST_CALIBRATED]
-atr_stop_mult = 2.5               ; 标准止损（配跌停排队重挂；寻优范围 1.0~3.0）
-kelly_fraction = 0.5              ; 激进仓位
 ```
 
 **中线稳健型**
@@ -598,26 +594,31 @@ cd BAISYS_QUANT
 
 ---
 
-#### [BACKTEST_CALIBRATED] — 回测自动校准参数
+#### 校准参数来源 — 数据库已采纳回测 → 出厂兜底（2026-11-04 架构改造）
 
-其中 8 个参数（boll_narrow_ratio / cross_decay_days / conclusion_full_bull / golden_cross_bonus / divergence_penalty / atr_stop_mult / buy_threshold / max_holdings）由 Walk-Forward 寻优引擎在回测期间自动搜索最优值并写回本分区；其余为静态默认值，日常运行无需手动修改。
+`config.ini` 不再保存回测↔复盘通信参数（`[BACKTEST_CALIBRATED]` 已废弃）。
+复盘单元在启动时按以下顺序取参：
 
-| 参数 | 默认值 | 说明 |
+1. **数据库** `backtest_calibration_log`：最近一条 `status='success' AND adopted=true` 的记录（仅门控通过的真实回测结果，非专业用户无法通过修改配置文件篡改）；
+2. **出厂兜底** `BackTrading/fallback_params.py` 代码常量：数据库无已采纳记录时（从未回测 / 回测失败 / 门控全部拦截）使用，镜像到数据库 `backtest_fallback_params` 表（启动自愈，删表/删行自动重建，SQL 可审计但不可持久篡改）。
+
+下表为出厂兜底默认值与说明（实际默认值以 `fallback_params.py` 为准）：
+
+| 参数 | 出厂兜底值 | 说明 |
 |------|--------|------|
-| `boll_narrow_ratio` | <font color="red">`0.9`</font> | 窄布林判定：带宽/历史均值 < 此值 → 震荡（由回测优化） |
-| `cross_decay_days` | <font color="red">`37`</font> | 金叉信号衰减天数，天（由回测优化） |
-| `atr_stop_mult` | <font color="red">`2.5`</font> | ATR 止损倍数：止损价 = close - ATR × 此值（由回测优化，2026-11 起 2.5 并配跌停排队重挂） |
-| `conclusion_full_bull` | <font color="red">`80`</font> | MACD 综合评分 ≥ 此值 → A 级（由回测优化） |
-| `golden_cross_bonus` | <font color="red">`10`</font> | R04: 金叉量价确认加分（由回测优化） |
-| `divergence_penalty` | <font color="red">`20`</font> | R41: 顶背离量缩扣分（由回测优化） |
-| `buy_threshold` | <font color="red">`17`</font> | 买入评分阈值（由回测优化） |
-| `max_holdings` | <font color="red">`11`</font> | 最大持仓数（由回测优化） |
-| `atr_t1_mult` | `4` | T1 目标价 ATR 倍数（静态） |
-| `liq_veto_ratio` | `0.065` | 流动性否决比（静态） |
-| `kelly_fraction` | `0.3` | Kelly 仓位比例系数（静态） |
-| `position_a` | `0.35` | A 级基础仓位（静态） |
-| `atr_t2_mult` | `5.0` | T2 目标价 ATR 倍数（静态） |
-| `risk_none_multiplier` | `1.0` | NONE 风险等级仓位系数（静态） |
+| `boll_narrow_ratio` | `0.6` | 窄布林判定：带宽/历史均值 < 此值 → 震荡 |
+| `cross_decay_days` | `30` | 金叉信号衰减天数，天 |
+| `atr_stop_mult` | `2.5` | ATR 止损倍数：止损价 = close - ATR × 此值（配跌停排队重挂） |
+| `conclusion_full_bull` | `78` | MACD 综合评分 ≥ 此值 → A 级 |
+| `golden_cross_bonus` | `12` | R04: 金叉量价确认加分 |
+| `divergence_penalty` | `25` | R41: 顶背离量缩扣分 |
+| `buy_threshold` | `30` | 买入评分阈值 |
+| `max_holdings` | `8` | 最大持仓数 |
+| `learned_t1_mult` / `learned_t2_mult` | `1.5` / `4` | VAEO 学习产出：T1/T2 止盈 ATR 倍数 |
+| `liq_veto_ratio` | `0.065` | 流动性否决比 |
+| `kelly_fraction` | `0.3` | Kelly 仓位比例系数 |
+| `position_a` | `0.35` | A 级基础仓位 |
+| `risk_none_multiplier` | `1.0` | NONE 风险等级仓位系数 |
 
 ---
 

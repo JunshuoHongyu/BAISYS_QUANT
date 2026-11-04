@@ -43,7 +43,6 @@ from BackTrading.calibration import (
     load_calibration,
     run_bayesian_walk_forward as run_walk_forward,
     save_calibration,
-    write_calibration_to_ini,
 )
 from BackTrading.calibration_log import ensure_table, get_last_run, record_run, should_rerun
 from UtilsManager.IDataProvider import BacktestDataProvider
@@ -263,11 +262,12 @@ def _acceptance_gate(
     pbo_gate: bool,
     dsr_gate: bool,
 ) -> tuple[bool, list[str]]:
-    """P0-5：统一参数采纳门控（save_calibration 与 write_calibration_to_ini 共用）。
+    """P0-5：统一参数采纳门控（2026-11-04 起与数据库 adopted 标记联动）。
 
-    门控结果用于标记参数质量并输出告警。门控不通过时，参数仍会写入
-    calibration_result.json（gate_passed=false）和 config.ini，但会输出
-    WARNING 告警提示过拟合风险，供人工复核。
+    门控结果用于标记参数质量并输出告警。门控通过 → record_run(adopted=true)，
+    复盘单元读取该记录；门控不通过 → adopted=false，参数仍写入
+    calibration_result.json（gate_passed=false 供人工复核），但复盘自动忽略，
+    回退上次已采纳参数或出厂兜底值，防止坏参数污染生产参考。
 
     Returns:
         (是否全部通过, 未通过原因列表)。
@@ -1193,11 +1193,12 @@ def run_backtest_pipeline(
         except Exception as _e:
             logger.warning(f"[P2.3] 回测结果持久化失败（不影响主流程）: {_e}")
 
-        # ── 统一参数采纳门控（P0-5 审计修复） ──
-        # save_calibration（calibration_result.json）与 write_calibration_to_ini
-        # （生产 config.ini）共用同一门控：统计显著性 + OOS 衰减 + PBO/DSR 硬性
-        # 拒绝 + 多重测试惩罚 + 稳健性 + 模拟验证，杜绝门控不一致导致 PBO 过拟合
-        # 参数集仍落盘进生产。
+        # ── 统一参数采纳门控（P0-5 审计修复；2026-11-04 adopted 语义） ──
+        # save_calibration（calibration_result.json）与回测→复盘数据库通道
+        # （backtest_calibration_log.adopted）共用同一门控：统计显著性 + OOS
+        # 衰减 + PBO/DSR 硬性拒绝 + 多重测试惩罚 + 稳健性 + 模拟验证；门控不通过
+        # 时 record_run(adopted=false)，复盘自动忽略该参数集，杜绝 PBO 过拟合
+        # 参数污染生产参考。
         _pbo_gate = pbo <= 0.05
         _dsr_gate = dsr >= 0.5
         if not _pbo_gate:
@@ -1299,24 +1300,22 @@ def run_backtest_pipeline(
         except Exception as e:
             logger.warning(f"[VAEO] 退出策略优化失败: {e}，回测结果将沿用默认止盈参数")
 
-        # FIX(P0-2): 门控阻断恶性循环 — gate_passed=false 时禁止写入 config.ini，
-        # 防止坏参数污染下次运行（上次坏参数 → WFO 预检失败 → 兜底用坏参数 → 再写入 → 循环）。
-        # calibration_result.json 仍始终保存（含 gate_passed=false 标记）供人工复核，
-        # 但 config.ini 只在门控通过时才覆写。
+        # FIX(P0-2) 门控阻断恶性循环（2026-11-04 架构改造后语义不变但**不再写 config.ini**）：
+        # 回测→复盘通信参数一律走数据库 backtest_calibration_log（adopted 标记），
+        # config.ini 只保留用户输入参数。gate_passed=false 的记录 adopted=FALSE，
+        # 复盘 get_last_adopted_run 天然排除，不会污染生产参考参数。
         if _gate_pass:
-            write_calibration_to_ini(best_params)
             apply_calibration_to_config(config)
-            logger.info("参数已写入 config.ini 并生效（门控通过）")
+            logger.info("校准参数已采纳（adopted=true，写入数据库），复盘将读取数据库参数")
         else:
             logger.warning("=" * 50)
             logger.warning(
-                "[采纳门控] 参数未通过统一采纳门控，config.ini 保持不变"
-                "（gate_passed=false，阻断恶性循环）: "
+                "[采纳门控] 参数未通过统一采纳门控，记录 adopted=false（阻断恶性循环）: "
                 + "；".join(_gate_reasons)
             )
             logger.warning(
-                "[采纳门控] calibration_result.json 已保存（含 gate_passed=false 标记）"
-                "供人工复核。如需强制采纳，请人工修改 config.ini [BACKTEST_CALIBRATED]。"
+                "[采纳门控] calibration_result.json 已保存（含 gate_passed=false 标记）供人工复核。"
+                "复盘不会使用本次未采纳参数（自动回退上次已采纳/出厂兜底值）。"
             )
             logger.warning("=" * 50)
 
@@ -1338,6 +1337,7 @@ def run_backtest_pipeline(
             git_commit=cal_result.git_commit,
             config_hash=cal_result.config_hash,
             data_version=_data_version,
+            adopted=_gate_pass,
         )
 
         updated_sections = set()
@@ -1345,9 +1345,9 @@ def run_backtest_pipeline(
             if k in CALIB_PARAM_MAP:
                 updated_sections.add(CALIB_PARAM_MAP[k][0])
         if _gate_pass:
-            logger.info(f"  寻优结果已采纳并写入 calibration_result.json + config.ini [{', '.join(sorted(updated_sections))}]")
+            logger.info(f"  寻优结果已采纳（adopted=true）并写入数据库 backtest_calibration_log [{', '.join(sorted(updated_sections))}]")
         else:
-            logger.info(f"  寻优结果未通过门控但已写入 calibration_result.json + config.ini [{', '.join(sorted(updated_sections))}]（gate_passed=false，请人工复核）")
+            logger.info(f"  寻优结果未通过门控（adopted=false）已写入数据库 backtest_calibration_log [{', '.join(sorted(updated_sections))}]（gate_passed=false，复盘自动忽略，请人工复核）")
         alert.on_success(cal_result)
         return cal_result
 

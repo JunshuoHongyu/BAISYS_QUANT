@@ -1,9 +1,10 @@
 """
 P0-5 统一参数采纳门控 测试
 
-runner.py 曾门控不一致：write_calibration_to_ini 未应用 PBO/DSR 门控
-（save_calibration 有）→ PBO 过拟合参数集仍可落盘进生产 config.ini。
-_acceptance_gate 为两处共用的统一门控，本文件覆盖全部门控项与回归场景。
+背景：旧实现门控不一致——写回通道未应用 PBO/DSR 门控，PBO 过拟合参数集
+曾可直接落盘进生产。2026-11-04 架构改造后，门控结果与数据库 adopted 标记
+联动：门控通过 → record_run(adopted=true) 供复盘读取；未通过 → adopted=false
+复盘自动忽略。_acceptance_gate 为统一门控，本文件覆盖全部门控项与回归场景。
 """
 
 from __future__ import annotations

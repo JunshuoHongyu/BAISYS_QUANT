@@ -1290,6 +1290,21 @@ class StockAnalysisCoordinatorFactory:
 
         config = Config(config_file=config_file)
 
+        # ── 2026-11-04 架构改造：回测→复盘通信参数统一走数据库 ──
+        # config.ini 不再保存校准结果；此处按 数据库最近已采纳回测 →
+        # 出厂兜底值 的顺序应用，保证复盘参考参数 =
+        # 最近通过采纳门控的真实回测结果（非专业用户无法通过改 config 篡改）。
+        try:
+            from BackTrading.calibration import apply_active_calibration
+
+            _cal = apply_active_calibration(config)
+            logger.info(
+                f"[复盘] 校准参数源={_cal['source']}"
+                + (f" (run_time={_cal['run_time']})" if _cal.get("run_time") else "（出厂兜底）")
+            )
+        except Exception as _cal_exc:
+            logger.warning(f"[复盘] 校准参数应用失败，使用 config 内置默认值继续: {_cal_exc}")
+
         try:
             from UtilsManager.ConfigValidator import validate_and_repair
             validate_and_repair(config_file)

@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     data_version    VARCHAR(40) DEFAULT '',
     pbo             NUMERIC(6,4) DEFAULT 0.0,
     dsr             NUMERIC(6,4) DEFAULT 0.0,
-    num_trials      INT DEFAULT 0
+    num_trials      INT DEFAULT 0,
+    adopted         BOOLEAN     NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_{TABLE}_run_time ON {TABLE} (run_time DESC);
@@ -73,6 +74,10 @@ def ensure_table(engine: Any) -> None:
         ("pbo", "NUMERIC(6,4) DEFAULT 0.0"),
         ("dsr", "NUMERIC(6,4) DEFAULT 0.0"),
         ("num_trials", "INT DEFAULT 0"),
+        # 2026-11-04 架构改造：校准结果从 config.ini 迁入数据库后，
+        # 需要 adopted 区分"门控通过已采纳"与"未采纳"——历史记录默认 FALSE，
+        # 复盘读取只认 adopted=TRUE，历史未采纳记录不会污染复盘参数。
+        ("adopted", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ]:
         try:
             if col == "lookback_days":
@@ -118,12 +123,24 @@ def get_last_successful_run(engine: Any) -> dict[str, Any] | None:
     等异常状态。注意：数据库记录不区分是否通过采纳门控，调用方需自行
     判断是否用于生产写入（本函数仅供审计/监控类场景使用）。
     """
+
+
+def get_last_adopted_run(engine: Any) -> dict[str, Any] | None:
+    """获取最近一次**已采纳**（status='success' AND adopted=TRUE）的回测记录。
+
+    2026-11-04 架构改造：回测→复盘通信参数改走数据库后，这是复盘单元
+    读取校准参数的唯一权威来源。adopted 语义由 runner 在门控判定后写入
+    （门控通过=true，拦截=false），配合 get_fallback_params 实现：
+    有采纳 → 用采纳；无采纳（从未回测/全失败/全拦截）→ 兜底出厂值。
+    """
     sql = text(f"""
         SELECT run_time, frequency, backtest_start_date, out_of_sample_days,
-               initial_cash, params, sharpe, total_return, max_drawdown, status,
-               config_hash, data_version, git_commit, pbo, dsr, num_trials
+               initial_cash, params, sharpe, sortino, calmar, total_return,
+               annual_return, max_drawdown, win_rate, profit_factor, total_trades,
+               status, config_hash, data_version, git_commit, pbo, dsr, num_trials,
+               adopted
         FROM {TABLE}
-        WHERE status = 'success'
+        WHERE status = 'success' AND adopted = TRUE
         ORDER BY run_time DESC
         LIMIT 1
     """)
@@ -242,6 +259,7 @@ def record_run(
     git_commit: str = "",
     config_hash: str = "",
     data_version: str = "",
+    adopted: bool | None = None,
 ) -> None:
     metrics = dict(extra_metrics or {})
     sortino = metrics.pop("sortino_ratio", None) or metrics.get("sortino", 0)
@@ -254,18 +272,22 @@ def record_run(
     pbo = metrics.pop("pbo", 0.0)
     dsr = metrics.pop("dsr", 0.0)
     num_trials = metrics.pop("num_trials", 0)
+    # 2026-11-04：门控语义显式化——None（旧调用方）视为未采纳 FALSE，
+    # 复盘读取只认 adopted=TRUE；gate_passed=false 的"成功"记录不再被误采纳。
+    if adopted is None:
+        adopted = False
 
     sql = text(f"""
         INSERT INTO {TABLE}
             (run_time, frequency, backtest_start_date, out_of_sample_days,
              initial_cash, params, sharpe, total_return, max_drawdown, status,
              sortino, calmar, var_95, cvar_95, win_rate, profit_factor, total_trades,
-             git_commit, config_hash, data_version, pbo, dsr, num_trials)
+             git_commit, config_hash, data_version, pbo, dsr, num_trials, adopted)
         VALUES
             (NOW(), :frequency, :backtest_start_date, :out_of_sample_days,
              :initial_cash, CAST(:params AS jsonb), :sharpe, :total_return, :max_drawdown, :status,
              :sortino, :calmar, :var_95, :cvar_95, :win_rate, :profit_factor, :total_trades,
-             :git_commit, :config_hash, :data_version, :pbo, :dsr, :num_trials)
+             :git_commit, :config_hash, :data_version, :pbo, :dsr, :num_trials, :adopted)
     """)
     with engine.begin() as conn:
         conn.execute(sql, _pyval({
@@ -291,8 +313,9 @@ def record_run(
             "pbo": pbo,
             "dsr": dsr,
             "num_trials": num_trials,
+            "adopted": adopted,
         }))
-    logger.info(f"回测记录已写入 {TABLE}")
+    logger.info(f"回测记录已写入 {TABLE} (adopted={adopted})")
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -895,52 +895,12 @@ class Config:
             api=ApiConfig(**self._section_upper("API")),
         )
 
-        # ── 回测自动校准参数覆写 ──
-        # [BACKTEST_CALIBRATED] 将校准参数（含 P0-7 ② 补齐的 buy_threshold/
-        # max_holdings）覆写到各自子模型，与 BackTrading/calibration.py 的
-        # CALIB_PARAM_MAP 保持一一对应，实现 INI 统一分组、写读闭环。
-        bt_cal = self._section_upper("BACKTEST_CALIBRATED")
-        if bt_cal:
-            sc = self.app_config.scoring_params
-            fr = self.app_config.filter_rules
-            rd = self.app_config.regime_detection
-            ps = self.app_config.position_sizing
-            if "BOLL_NARROW_RATIO" in bt_cal:
-                rd.BOLL_NARROW_RATIO = float(bt_cal["BOLL_NARROW_RATIO"])
-            if "CROSS_DECAY_DAYS" in bt_cal:
-                sc.CROSS_DECAY_DAYS = int(bt_cal["CROSS_DECAY_DAYS"])
-            if "ATR_STOP_MULT" in bt_cal:
-                sc.ATR_STOP_MULT = float(bt_cal["ATR_STOP_MULT"])
-            # VAEO 波动率自适应退出参数覆写
-            if "LEARNED_T1_MULT" in bt_cal:
-                sc.LEARNED_T1_MULT = float(bt_cal["LEARNED_T1_MULT"])
-            if "LEARNED_T2_MULT" in bt_cal:
-                sc.LEARNED_T2_MULT = float(bt_cal["LEARNED_T2_MULT"])
-            if "LIQ_VETO_RATIO" in bt_cal:
-                fr.LIQ_VETO_RATIO = float(bt_cal["LIQ_VETO_RATIO"])
-            if "KELLY_FRACTION" in bt_cal:
-                ps.KELLY_FRACTION = float(bt_cal["KELLY_FRACTION"])
-            if "POSITION_A" in bt_cal:
-                ps.POSITION_A = float(bt_cal["POSITION_A"])
-            if "POSITION_B" in bt_cal:
-                ps.POSITION_B = float(bt_cal["POSITION_B"])
-            if "POSITION_C" in bt_cal:
-                ps.POSITION_C = float(bt_cal["POSITION_C"])
-            if "CONCLUSION_FULL_BULL" in bt_cal:
-                self.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(bt_cal["CONCLUSION_FULL_BULL"])
-            if "GOLDEN_CROSS_BONUS" in bt_cal:
-                sc.GOLDEN_CROSS_BONUS = int(bt_cal["GOLDEN_CROSS_BONUS"])
-            if "DIVERGENCE_PENALTY" in bt_cal:
-                sc.DIVERGENCE_PENALTY = int(bt_cal["DIVERGENCE_PENALTY"])
-            if "RISK_NONE_MULTIPLIER" in bt_cal:
-                ps.RISK_NONE_MULTIPLIER = float(bt_cal["RISK_NONE_MULTIPLIER"])
-            # 日频路径不生效；现覆写到 backtest 配置供 EngineConfig 兜底读取。
-            # 注：历史版本可能以 "17.0" 浮点落盘，此处 int(float()) 容错兼容，
-            # 新写入已由 calibration.py 类型断言保证整值。
-            if "BUY_THRESHOLD" in bt_cal:
-                self.app_config.backtest.BUY_THRESHOLD = int(float(bt_cal["BUY_THRESHOLD"]))
-            if "MAX_HOLDINGS" in bt_cal:
-                self.app_config.backtest.MAX_HOLDINGS = int(float(bt_cal["MAX_HOLDINGS"]))
+        # ── 2026-11-04 架构改造 ──
+        # [BACKTEST_CALIBRATED] 回测→复盘通信参数已从 config.ini 迁入数据库
+        # （backtest_calibration_log.adopted / fallback_params），此处不再覆写；
+        # 复盘单元通过 BackTrading.calibration.apply_active_calibration() 统一
+        # 应用数据库参数（或出厂兜底）。遗留 config.ini 中的该段将被忽略，
+        # 建议删除（config.ini 只保留用户输入参数）。
 
     def reload(self) -> None:
         """热重载配置文件，保留 config_file 路径。"""

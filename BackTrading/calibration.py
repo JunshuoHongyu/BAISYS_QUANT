@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import subprocess
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -66,12 +65,10 @@ from loguru import logger
 
 from BackTrading.bayesian.space import build_spaces, split_by_cost, describe
 
-# config.ini 中参数名 → (section, key) 映射
-# ── 寻优参数（bayesian optimizer 搜索，写回闭环）──
-# ── 受控静态参数（POSITION_SIZING；回测引擎等权不消费，但复盘 PositionSizer 使用）──
-# 受控参数写在 [BACKTEST_CALIBRATED] 同一分区，由 ConfigParser.apply_backtest_calibrated_override() 读取；
-# 此处不加入 bayesian 搜索空间（见 bayesian/space.py DEAD_KEYS），但保留写回路径，
-# 以便 apply_calibration_to_config 和 write_calibration_to_ini 能处理手动写入的校准值。
+# 校准参数键白名单（2026-11-04 架构改造后不再写回 config.ini，
+# 仅作为"受控校准参数清单"供审计/检索使用；实际应用由
+# apply_active_calibration → _apply_params_to_config 完成，
+# 数据源为数据库 backtest_calibration_log / fallback_params）。
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     # 寻优参数
     "atr_stop_mult": ("BACKTEST_CALIBRATED", "atr_stop_mult"),
@@ -135,15 +132,6 @@ class CalibrationResult:
 
 
 CALIBRATION_FILE = PROJECT_ROOT / "calibration_result.json"
-CONFIG_INI = PROJECT_ROOT / "config.ini"
-
-# 写入 config.ini 时需取整的整数参数
-# 一旦加载端 int() 解析即崩溃；现强制整值落盘（写入前另有类型断言）。
-_INT_KEYS = frozenset({
-    "cross_decay_days", "conclusion_full_bull",
-    "golden_cross_bonus", "divergence_penalty",
-    "buy_threshold", "max_holdings",
-})
 
 
 def run_bayesian_walk_forward(
@@ -315,7 +303,68 @@ def audit_cost_model_vs_calibration() -> list[str]:
 
 
 
+def _apply_params_to_config(cfg: object, overrides: dict) -> None:
+    """将校准参数覆写到 Config 各子模型（回测→复盘通信的唯一应用点）。
+
+    2026-11-04 架构改造：数据源由 config.ini [BACKTEST_CALIBRATED] / json
+    统一改为数据库/兜底常量，但覆写目标字段保持不变（与 ConfigParser 旧
+    override 行为一一对应，迁移前后复盘行为零变化）。
+    """
+    if not overrides:
+        return
+
+    rd = cfg.app_config.regime_detection
+    sc = cfg.app_config.scoring_params
+    fr = cfg.app_config.filter_rules
+    ps = cfg.app_config.position_sizing
+
+    for key, val in overrides.items():
+        attr = key.upper()
+        if key == "boll_narrow_ratio":
+            rd.BOLL_NARROW_RATIO = float(val)
+        elif key == "cross_decay_days":
+            sc.CROSS_DECAY_DAYS = int(val)
+        elif key == "atr_stop_mult":
+            setattr(sc, attr, float(val))
+        elif key == "conclusion_full_bull":
+            cfg.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(val)
+        elif key == "golden_cross_bonus":
+            sc.GOLDEN_CROSS_BONUS = int(val)
+        elif key == "divergence_penalty":
+            sc.DIVERGENCE_PENALTY = int(val)
+        elif key == "learned_t1_mult":
+            sc.LEARNED_T1_MULT = float(val)
+        elif key == "learned_t2_mult":
+            sc.LEARNED_T2_MULT = float(val)
+        elif key == "liq_veto_ratio":
+            fr.LIQ_VETO_RATIO = float(val)
+        # 现覆写到 backtest 配置（与 ConfigParser [BACKTEST_CALIBRATED] 覆写同目标）
+        elif key == "buy_threshold":
+            cfg.app_config.backtest.BUY_THRESHOLD = int(float(val))
+        elif key == "max_holdings":
+            cfg.app_config.backtest.MAX_HOLDINGS = int(float(val))
+        # 受控静态参数（Position Sizer 消费；回测引擎等权不消费）
+        elif key == "kelly_fraction":
+            ps.KELLY_FRACTION = float(val)
+        elif key == "position_a":
+            ps.POSITION_A = float(val)
+        elif key == "position_b":
+            ps.POSITION_B = float(val)
+        elif key == "position_c":
+            ps.POSITION_C = float(val)
+        elif key == "risk_none_multiplier":
+            ps.RISK_NONE_MULTIPLIER = float(val)
+        else:
+            logger.warning(f"[校准应用] 未知校准参数键 {key!r}，已忽略（白名单制）")
+
+
 def apply_calibration_to_config(config: object) -> None:
+    """[兼容保留] 从 calibration_result.json 应用校准参数（json 快照来源）。
+
+    2026-11-04 架构改造后，生产路径请改用 apply_active_calibration()
+    （数据库/兜底来源）；本函数仅供 runner 内部同进程即时应用 json 快照，
+    以及审计类调用（成本审计比对等）保留。
+    """
     from UtilsManager.ConfigParser import Config
 
     assert isinstance(config, Config), f"需要 Config 实例，收到 {type(config).__name__}"
@@ -335,43 +384,62 @@ def apply_calibration_to_config(config: object) -> None:
             f"参数仍将应用到生产配置，请人工复核过拟合风险"
         )
 
-    rd = cfg.app_config.regime_detection
-    sc = cfg.app_config.scoring_params
-    fr = cfg.app_config.filter_rules
-    ps = cfg.app_config.position_sizing
+    _apply_params_to_config(cfg, overrides)
 
-    for key, val in overrides.items():
-        attr = key.upper()
-        if key == "boll_narrow_ratio":
-            rd.BOLL_NARROW_RATIO = val
-        elif key == "cross_decay_days":
-            sc.CROSS_DECAY_DAYS = int(val)
-        elif key == "atr_stop_mult":
-            setattr(sc, attr, val)
-        elif key == "conclusion_full_bull":
-            cfg.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(val)
-        elif key == "golden_cross_bonus":
-            sc.GOLDEN_CROSS_BONUS = int(val)
-        elif key == "divergence_penalty":
-            sc.DIVERGENCE_PENALTY = int(val)
-        # 现覆写到 backtest 配置（与 ConfigParser [BACKTEST_CALIBRATED] 覆写同目标）
-        elif key == "buy_threshold":
-            cfg.app_config.backtest.BUY_THRESHOLD = int(val)
-        elif key == "max_holdings":
-            cfg.app_config.backtest.MAX_HOLDINGS = int(val)
-        # 受控静态参数（Position Sizer 消费；回测引擎等权不消费）
-        # 若校准结果中出现了这些键（如手动写入 calibration_result.json），
-        # 则写回至 PositionSizingConfig，确保复盘与配置一致。
-        elif key == "kelly_fraction":
-            ps.KELLY_FRACTION = float(val)
-        elif key == "position_a":
-            ps.POSITION_A = float(val)
-        elif key == "position_b":
-            ps.POSITION_B = float(val)
-        elif key == "position_c":
-            ps.POSITION_C = float(val)
-        elif key == "risk_none_multiplier":
-            ps.RISK_NONE_MULTIPLIER = float(val)
+
+def apply_active_calibration(config: object, engine: Any | None = None) -> dict:
+    """复盘单元统一参数入口：数据库已采纳回测 → 兜底工厂值。
+
+    2026-11-04 架构改造的核心函数：
+      - config.ini 不再保存回测→复盘通信参数；
+      - 复盘读取顺序：backtest_calibration_log 最新 adopted=TRUE 成功记录
+        → 无则 backtest_fallback_params 兜底（源码写死，任何配置/DB 篡改
+        都无法改变）；
+      - 回测失败/从未回测/DB 异常时**永不中断**，降级兜底并醒目告警。
+
+    Args:
+        config: Config 实例（将被就地覆写各子模型）。
+        engine: SQLAlchemy engine，缺省自动创建。
+
+    Returns:
+        {"source": "db_adopted" | "fallback", "params": dict, "run_time": str|None}
+    """
+    from UtilsManager.ConfigParser import Config
+
+    assert isinstance(config, Config), f"需要 Config 实例，收到 {type(config).__name__}"
+    if engine is None:
+        from DataManager.DbEngine import get_engine
+        engine = get_engine(config)
+
+    from BackTrading.fallback_params import ensure_fallback_params, get_fallback_params
+    from BackTrading.calibration_log import get_last_adopted_run
+
+    run = None
+    try:
+        ensure_fallback_params(engine)
+        run = get_last_adopted_run(engine)
+    except Exception as exc:  # 数据库不可用时兜底链路仍然可用
+        logger.warning(f"[校准应用] 数据库读取失败（{exc}），降级使用出厂兜底参数")
+
+    if run and run.get("params"):
+        params = {k: v for k, v in run["params"].items() if not str(k).startswith("_")}
+        source = "db_adopted"
+        run_time = str(run.get("run_time") or "")
+        logger.info(
+            f"[校准应用] 使用数据库最近已采纳回测参数 source=db_adopted "
+            f"run_time={run_time} keys={len(params)}"
+        )
+    else:
+        params = get_fallback_params(engine)
+        source = "fallback"
+        run_time = None
+        logger.warning(
+            "[校准应用] ⚠️ 数据库无已采纳回测记录（从未回测/全部失败/全部被门控拦截），"
+            f"回退出厂兜底参数 keys={len(params)}（回测缺失期间复盘仍有生产参考价值）"
+        )
+
+    _apply_params_to_config(config, params)
+    return {"source": source, "params": params, "run_time": run_time}
 
 
 def _get_git_commit() -> str:
@@ -385,108 +453,3 @@ def _get_git_commit() -> str:
         return ""
 
 
-def _format_val(key: str, val: Any) -> str:
-    """按字段语义格式化配置值：整数参数取整，浮点去尾零，避免 int('37.0') 崩溃。"""
-    if key in _INT_KEYS:
-        return str(int(round(float(val))))
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return str(val)
-    s = f"{v:.10f}".rstrip("0").rstrip(".")
-    return s if s not in ("", "-0") else "0"
-
-
-def write_calibration_to_ini(params: dict) -> dict | None:
-    """将校准参数写入 config.ini 的 [BACKTEST_CALIBRATED]。
-
-    已有键原位替换（保留行尾注释），新键追加到 section 末尾；
-    整型参数取整写入，避免下次加载时 int() 解析崩溃；原子写防半截文件。
-    返回实际落盘参数（整数参数已取整），未写入时返回 None。
-    """
-    if not params:
-        logger.info("无校准参数，跳过写入")
-        return None
-    # 过滤运行时注入键，防止 Engine/ST历史等对象被 str() 后写入 config.ini
-    params = {k: v for k, v in params.items() if k not in _RUNTIME_KEYS}
-    if not params:
-        logger.info("过滤运行时键后无校准参数，跳过写入")
-        return None
-    # 31.5/17.5/11.5 等非整值；旧实现在此 fail-fast 抛 ValueError 后被调用方
-    # except 吞掉，导致 config.ini 实际未写但日志谎报"已写入"。现在仅对
-    # 无法转换为数值的值 fail-fast，非整数值 round 后落盘。
-    sanitized = dict(params)
-    for k in sorted(_INT_KEYS & set(sanitized)):
-        v = sanitized[k]
-        try:
-            sanitized[k] = int(round(float(v)))
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"[校准写回] 整数参数 {k} = {v!r} 无法转换为数值，拒绝写入 config.ini（防 int() 解析崩溃）"
-            ) from None
-    params = sanitized
-    ini_path = CONFIG_INI
-    if not ini_path.exists():
-        logger.warning(f"config.ini 不存在: {ini_path}")
-        return None
-
-    text = ini_path.read_text(encoding="utf-8")
-    section_header = "[BACKTEST_CALIBRATED]"
-    lines = text.splitlines(keepends=True)
-
-    # 定位 section（或在其后插入）
-    sec_idx = None
-    for i, ln in enumerate(lines):
-        s = ln.strip()
-        if s.startswith("["):
-            if s == section_header:
-                sec_idx = i
-                break
-            if sec_idx is not None:
-                break
-    if sec_idx is None:
-        if text and not text.endswith("\n"):
-            text += "\n"
-        text += f"\n{section_header}\n"
-        lines = text.splitlines(keepends=True)
-        sec_idx = len(lines) - 1
-
-    written: set[str] = set()
-    out: list[str] = []
-    in_section = False
-    for ln in lines:
-        s = ln.strip()
-        if s.startswith("["):
-            in_section = s == section_header
-            out.append(ln)
-            continue
-        if in_section and "=" in s and not s.startswith(("#", ";")):
-            key = s.split("=", 1)[0].strip().lower()
-            if key in params:
-                comment = ""
-                cm = re.search(r"#.*$", ln)
-                if cm:
-                    comment = cm.group(0)
-                body = f"{key} = {_format_val(key, params[key])}"
-                ln = body + ("  " + comment if comment else "") + ("\n" if ln.endswith("\n") else "")
-                written.add(key)
-        out.append(ln)
-
-    # 追加未写出的键（插到 [BACKTEST_CALIBRATED] section 内容末尾，而非文件最后一个 section）
-    missing = {k for k in params if k not in written}
-    if missing:
-        # 从 sec_idx+1 往后找下一个 section header，在其前插入；
-        # 若无后续 section 则追加到文件末尾
-        insert_at = len(out)
-        for i in range(sec_idx + 1, len(out)):
-            if out[i].strip().startswith("["):
-                insert_at = i
-                break
-        extra = "".join(f"{k} = {_format_val(k, params[k])}\n" for k in sorted(missing))
-        out.insert(insert_at, extra)
-
-    tmp_path = ini_path.with_name(ini_path.name + ".tmp")
-    tmp_path.write_text("".join(out), encoding="utf-8")
-    os.replace(tmp_path, ini_path)
-    logger.info(f"校准参数已写入 {ini_path} [{section_header}]")
-    return params

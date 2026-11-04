@@ -82,7 +82,8 @@ def extend_spaces_to_cover(
 # config.ini _RANGE 字段名 → 参数名映射
 # 注：kelly_fraction / position_a / position_b / position_c / risk_none_multiplier
 # 已在引擎审计中确认为 DEAD_KEYS（回测引擎仓位模型=等权，不消费这些字段）；
-# 保留在 config.ini [BACKTEST_CALIBRATED] 供复盘 PositionSizer 读取（受控静态参数），
+# 2026-11-04 架构改造后由 apply_active_calibration 从数据库 adopted 记录 /
+# fallback 兜底常量写入 PositionSizingConfig 供复盘 PositionSizer 读取（受控静态参数），
 # 见 calibration.py CALIB_PARAM_MAP 中的 "受控静态参数" 注释。
 # 若将来回测引擎改为 Kelly 仓位模型，需同步：
 #  1. 从 parameter_robustness.py DEAD_KEYS 移除

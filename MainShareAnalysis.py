@@ -120,11 +120,9 @@ def main() -> None:
 
                 result = run_backtest_pipeline(cfg, force=True)
                 if result is None:
-                    logger.warning("回测未完成，使用现有参数继续复盘")
+                    logger.warning("回测未完成；复盘将使用数据库已采纳参数（无则出厂兜底值）")
                 else:
-                    logger.info("回测校准完成，参数已写入 config.ini")
-                    # 重新加载配置，让复盘模块使用最新参数
-                    cfg = Config()
+                    logger.info("回测校准完成，参数已写入数据库 backtest_calibration_log（复盘自动读取）")
             else:
                 logger.info(f"回测未到期（{reason}），跳过校准，直接复盘")
         else:
