@@ -152,10 +152,26 @@ def _oos_validate(
                 data_version=data_version,
             )
         else:
-            _prepared = test_data
-            # 无信号参数时也按 eval_start_date 截断，避免预热段产生交易
-            if eval_start_date and "trade_date" in _prepared.columns:
-                _prepared = _prepared[_prepared["trade_date"] >= eval_start_date]
+            # FIX(2026-11-05)：解耦寻优后 BO 只采样 3 维组合参数（params 无信号键）。
+            # 旧实现直接以裸 test_data 当 prepared → 引擎 KeyError('进场评分')。
+            # 组合层评估同样需要信号列：若 test_data 未预计算，用锚定信号常数
+            # （_FIXED_PARAMS 中 5 个信号参数）补算一次（param_hash 稳定可命中信号缓存）。
+            if "进场评分" in test_data.columns:
+                _prepared = test_data
+                # 无信号参数时也按 eval_start_date 截断，避免预热段产生交易
+                if eval_start_date and "trade_date" in _prepared.columns:
+                    _prepared = _prepared[_prepared["trade_date"] >= eval_start_date]
+            else:
+                from BackTrading.bayesian.space import _get_fixed_params as _sf
+                _fixed_sig = {
+                    k: v for k, v in _sf().items()
+                    if k in _SIGNAL_KEYS
+                }
+                _prepared = prepare_backtest_data(
+                    test_data, params=_fixed_sig, compute_exit_strategy=True,
+                    vectorized=True, backtest_start_date=eval_start_date,
+                    data_version=data_version,
+                )
         engine_params = dict(params)
         if st_history:
             engine_params["_st_history"] = st_history
