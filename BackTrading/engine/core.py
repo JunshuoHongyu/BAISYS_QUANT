@@ -1670,6 +1670,10 @@ def _run_single_backtest(
                 {
                     "time": dt,
                     "portfolio_value": _round_half_up(_last_total_value),
+                    # 2026-11-09 修复：持久化 cash/持仓市值，否则 backtest_equity 这两列
+                    # 恒为 NULL，离线守恒审计(_pf_audit)无法独立校验"已实现 vs 未实现"。
+                    "cash": _round_half_up(cash),
+                    "position_value": _round_half_up(_last_total_value - cash),
                     "turnover": 0.0,
                 }
             )
@@ -2778,13 +2782,17 @@ def _run_single_backtest(
             if _row_hit is None or not bool(has_volume[_row_hit]):
                 _update_adv(_s_h, 0.0)
 
-        total_value = cash + _calc_market_value()
+        _mv_now = _calc_market_value()
+        total_value = cash + _mv_now
         _turnover = (daily_buy_value + daily_sell_value) / (2 * total_value) if total_value > 0 else 0.0
         _last_total_value = total_value
         _susp_v = _susp_position_value()
         _ec_rec = {
             "time": dt,
             "portfolio_value": _round_half_up(total_value),
+            # 2026-11-09 修复：补 cash/持仓市值，供离线守恒审计独立校验
+            "cash": _round_half_up(cash),
+            "position_value": _round_half_up(_mv_now),
             "turnover": round(_turnover, 6),
         }
         if _susp_v > 0 and total_value > 0:

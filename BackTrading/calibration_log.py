@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     dsr             NUMERIC(6,4) DEFAULT 0.0,
     num_trials      INT DEFAULT 0,
     num_windows     INT DEFAULT 0,
+    -- 全期（评估期）Sharpe：与 sharpe（选择期/holdout 口径）并列保存，
+    -- 避免"选择期 Sharpe 与评估期 total_return 混存被误读"（2026-11-09 修复）
+    full_sharpe     NUMERIC(8,4),
+    -- 采纳门控未通过的具体原因（此前只写日志，无法 SQL 归因）
+    gate_reasons    JSONB DEFAULT '[]'::jsonb,
     sharpe_scope    VARCHAR(32) DEFAULT '',
     oos_sharpe      NUMERIC(8,4),
     adopted         BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -83,6 +88,8 @@ def ensure_table(engine: Any) -> None:
         # sharpe_scope 标明 sharpe 属于哪个区间（holdout / WFO Top5 均值），
         # 避免与评估期的 total_return/max_drawdown 混读。
         ("num_windows", "INT DEFAULT 0"),
+        ("full_sharpe", "NUMERIC(8,4)"),
+        ("gate_reasons", "JSONB DEFAULT '[]'::jsonb"),
         ("sharpe_scope", "VARCHAR(32) DEFAULT ''"),
         ("oos_sharpe", "NUMERIC(8,4)"),
         # 2026-11-04 架构改造：校准结果从 config.ini 迁入数据库后，
@@ -109,7 +116,7 @@ def ensure_table(engine: Any) -> None:
 def get_last_run(engine: Any) -> dict[str, Any] | None:
     sql = text(f"""
         SELECT run_time, frequency, backtest_start_date, out_of_sample_days,
-               initial_cash, params, sharpe, total_return, max_drawdown, status,
+               initial_cash, params, sharpe, full_sharpe, total_return, max_drawdown, status,
                config_hash, data_version, git_commit
         FROM {TABLE}
         ORDER BY run_time DESC
@@ -136,6 +143,27 @@ def get_last_successful_run(engine: Any) -> dict[str, Any] | None:
     等异常状态。注意：数据库记录不区分是否通过采纳门控，调用方需自行
     判断是否用于生产写入（本函数仅供审计/监控类场景使用）。
     """
+    # 2026-11-09 修复：本函数此前只有 docstring、无函数体，恒返回 None，
+    # 导致 alert.py 的漂移检测在 JSON 空壳时永远无法从数据库取到比对基准。
+    sql = text(f"""
+        SELECT run_time, frequency, backtest_start_date, out_of_sample_days,
+               initial_cash, params, sharpe, full_sharpe, total_return,
+               annual_return, annual_vol, max_drawdown, max_drawdown_duration,
+               status, config_hash, data_version, git_commit, adopted,
+               sharpe_scope, oos_sharpe
+        FROM {TABLE}
+        WHERE status = 'success'
+        ORDER BY run_time DESC
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(sql).mappings().fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    if isinstance(result.get("params"), str):
+        result["params"] = json.loads(result["params"])
+    return result
 
 
 def get_last_adopted_run(engine: Any) -> dict[str, Any] | None:
@@ -151,7 +179,7 @@ def get_last_adopted_run(engine: Any) -> dict[str, Any] | None:
                initial_cash, params, sharpe, sortino, calmar, total_return,
                annual_return, max_drawdown, win_rate, profit_factor, total_trades,
                status, config_hash, data_version, git_commit, pbo, dsr, num_trials,
-               num_windows, sharpe_scope, oos_sharpe,
+               num_windows, sharpe_scope, oos_sharpe, full_sharpe, gate_reasons,
                adopted, direction_audit
         FROM {TABLE}
         WHERE status = 'success' AND adopted = TRUE
@@ -165,8 +193,9 @@ def get_last_adopted_run(engine: Any) -> dict[str, Any] | None:
     result = dict(row)
     if isinstance(result.get("params"), str):
         result["params"] = json.loads(result["params"])
-    if result.get("direction_audit") is not None and isinstance(result["direction_audit"], str):
-        result["direction_audit"] = json.loads(result["direction_audit"])
+    for _json_col in ("direction_audit", "gate_reasons"):
+        if isinstance(result.get(_json_col), str):
+            result[_json_col] = json.loads(result[_json_col])
     return result
 
 
@@ -277,8 +306,17 @@ def record_run(
     data_version: str = "",
     adopted: bool | None = None,
     direction_audit: dict[str, Any] | None = None,
+    full_sharpe: float | None = None,
+    gate_reasons: list[str] | None = None,
 ) -> None:
     metrics = dict(extra_metrics or {})
+    # 2026-11-09 修复：以下三列此前在 extra_metrics 中存在却从未写入库，
+    # 导致历史记录 annual_return/annual_vol/max_drawdown_duration 恒为 NULL。
+    annual_return = metrics.pop("annual_return", None)
+    annual_vol = metrics.pop("annual_vol", None)
+    max_drawdown_duration = metrics.pop("max_drawdown_duration", None)
+    if full_sharpe is None:
+        full_sharpe = metrics.pop("full_sharpe", None)
     sortino = metrics.pop("sortino_ratio", None) or metrics.get("sortino", 0)
     calmar = metrics.pop("calmar_ratio", None) or metrics.get("calmar", 0)
     var_95 = metrics.pop("var_95", 0)
@@ -303,13 +341,16 @@ def record_run(
              initial_cash, params, sharpe, total_return, max_drawdown, status,
              sortino, calmar, var_95, cvar_95, win_rate, profit_factor, total_trades,
              git_commit, config_hash, data_version, pbo, dsr, num_trials, adopted,
-             direction_audit, num_windows, sharpe_scope, oos_sharpe)
+             direction_audit, num_windows, sharpe_scope, oos_sharpe,
+             annual_return, annual_vol, max_drawdown_duration, full_sharpe, gate_reasons)
         VALUES
             (NOW(), :frequency, :backtest_start_date, :out_of_sample_days,
              :initial_cash, CAST(:params AS jsonb), :sharpe, :total_return, :max_drawdown, :status,
              :sortino, :calmar, :var_95, :cvar_95, :win_rate, :profit_factor, :total_trades,
              :git_commit, :config_hash, :data_version, :pbo, :dsr, :num_trials, :adopted,
-             CAST(:direction_audit AS jsonb), :num_windows, :sharpe_scope, :oos_sharpe)
+             CAST(:direction_audit AS jsonb), :num_windows, :sharpe_scope, :oos_sharpe,
+             :annual_return, :annual_vol, :max_drawdown_duration, :full_sharpe,
+             CAST(:gate_reasons AS jsonb))
     """)
     with engine.begin() as conn:
         conn.execute(sql, _pyval({
@@ -340,6 +381,11 @@ def record_run(
             "oos_sharpe": oos_sharpe,
             "adopted": adopted,
             "direction_audit": json.dumps(_pyval(direction_audit or {}), ensure_ascii=False),
+            "annual_return": annual_return,
+            "annual_vol": annual_vol,
+            "max_drawdown_duration": max_drawdown_duration,
+            "full_sharpe": full_sharpe,
+            "gate_reasons": json.dumps(_pyval(gate_reasons or []), ensure_ascii=False),
         }))
     logger.info(f"回测记录已写入 {TABLE} (adopted={adopted})")
 

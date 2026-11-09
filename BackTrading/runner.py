@@ -1206,6 +1206,7 @@ def run_backtest_pipeline(
             num_windows=num_windows,
             sharpe_scope=_sharpe_scope,
             oos_sharpe=holdout_sharpe,
+            full_sharpe=risk.get("sharpe_ratio"),
             cost_model_snapshot=_cost_snapshot,
         )
 
@@ -1257,7 +1258,8 @@ def run_backtest_pipeline(
         if not _windows_sufficient:
             logger.warning(
                 f"[过拟合防护] 有效窗口数 {num_windows} < {MIN_PBO_WINDOWS}，"
-                f"样本不足以支撑统计采纳（与 PBO 指标解耦，单独把关）"
+                f"样本不足以支撑统计采纳（与 PBO 指标解耦，单独把关）；"
+                f"请缩短 WFO 训练窗口或延长回测历史，否则每次校准都会因窗口不足被拒"
             )
         _gate_pass, _gate_reasons = _acceptance_gate(
             promote=_promote,
@@ -1441,6 +1443,8 @@ def run_backtest_pipeline(
             data_version=_data_version,
             adopted=_gate_pass,
             direction_audit=cal_result.direction_audit,
+            full_sharpe=cal_result.full_sharpe,
+            gate_reasons=cal_result.gate_reasons,
         )
 
         updated_sections = set()

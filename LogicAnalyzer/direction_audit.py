@@ -178,6 +178,11 @@ class DirectionAuditReport:
     # L3
     l3_ic: float | None = None
     l3_n: int = 0
+    # L1 分段稳定性（2026-11-09）：factor -> {period -> IC}
+    # 用于区分"标签/方向 bug"（全时段一致为负）与"市场风格切换"（符号随时段翻转），
+    # 两者处置方式完全不同（改代码 vs regime 化赋权）。
+    period_ics: dict[str, dict[str, float | None]] = field(default_factory=dict)
+    regime_flip: bool = False
     # 判定
     verdict: str = "🟢"  # 🔴 / 🟡 / 🟢
     reasons: list[str] = field(default_factory=list)
@@ -197,6 +202,8 @@ class DirectionAuditReport:
             "l3_ic": (None if self.l3_ic is None or not np.isfinite(self.l3_ic)
                       else round(float(self.l3_ic), 5)),
             "l3_n": self.l3_n,
+            "period_ics": self.period_ics,
+            "regime_flip": self.regime_flip,
             "verdict": self.verdict,
             "reasons": self.reasons,
         }
@@ -323,6 +330,35 @@ def audit_direction(
                 flipped.append(fac)
     report.flipped_factors = flipped
 
+    # ── L1b：分段 IC 稳定性（2026-11-09）──────────────────────
+    # 按半年切段计算每个因子 IC：
+    #   全时段一致为负 → 更像标签对齐/因子构造 bug（需改代码）
+    #   符号随时段翻转 → 更像市场风格切换（需 regime 化赋权，删因子无用）
+    try:
+        _td = sub["trade_date"].astype(str)
+        sub["_period"] = [f"{t[:4]}H{1 if int(t[5:7]) <= 6 else 2}" for t in _td]
+        for fac in EXPECTED_SIGNS:
+            if fac not in sub.columns:
+                continue
+            segment: dict[str, float | None] = {}
+            for p, g in sub.groupby("_period"):
+                ic_p = _spearman(g[fac], g[fc], min_n=50)
+                segment[str(p)] = None if not np.isfinite(ic_p) else round(float(ic_p), 4)
+            if segment:
+                report.period_ics[fac] = segment
+        sub.drop(columns=["_period"], inplace=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  分段 IC 计算跳过: {e}", file=sys.stderr)
+
+    _flip_factors = 0
+    for _fac, _seg in report.period_ics.items():
+        _signs = [1 if v > _NEUTRAL_IC else (-1 if v < -_NEUTRAL_IC else 0)
+                  for v in _seg.values() if v is not None]
+        _signs = [x for x in _signs if x != 0]
+        if len(_signs) >= 2 and max(_signs) > 0 and min(_signs) < 0:
+            _flip_factors += 1
+    report.regime_flip = bool(_flip_factors >= max(2, len(report.period_ics) // 3))
+
     # ── L2：候选区间 Q1~Q5 形态（秩相关 + 高分≥中位数） ───────
     try:
         sub["_q"] = pd.qcut(sub["综合评分"], 5, labels=False, duplicates="drop")
@@ -374,6 +410,11 @@ def audit_direction(
         l2_available=len(report.l2_quintile_means) >= 3,
         l3_ic=report.l3_ic,
     )
+    if report.verdict != "🟢" and report.regime_flip:
+        report.reasons.append(
+            "分段 IC 符号翻转（多个因子在不同半年段方向相反）→ 疑似市场风格切换，"
+            "应做 regime 化赋权/降权，而不是直接删除因子或反转评分"
+        )
 
     del frame, sub
     gc.collect()

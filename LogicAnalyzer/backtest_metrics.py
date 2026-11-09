@@ -89,24 +89,31 @@ def compute_risk_metrics(
     excess_mu = mu - risk_free_rate
     sharpe = excess_mu / sigma if sigma > 0 else 0.0
 
-    downside = returns[returns < 0]
     # 原逻辑：float("inf") → DSR/PBO 污染 / scipy 优化器 NaN
     _SORTINO_CEILING = 100.0
     sortino_reliable = True  # AUDIT_FIX Step 10: Sortino 可靠性标志
-    if len(downside) == 0:
+    # 2026-11-09 修复（Sortino 口径）：下行风险用标准半偏差定义
+    #     DD = sqrt( mean( min(r - MAR, 0)^2 ) ) * sqrt(ann_factor)
+    # 分母取**全部 N 个观测**（正收益日贡献 0），MAR 为日频无风险利率。
+    # 旧实现用 returns[returns<0].std()（负收益子集的样本标准差），
+    # 子集 std 会系统性大于半偏差（排除了 0 附近样本、只留下尾部），
+    # 导致 Sortino 被低估 —— 实测出现 Sortino(0.0858) < Sharpe(0.2339) 的
+    # 数学上不可能的组合（下行波动 21.8% > 总波动 8.5%）。
+    _mar_daily = risk_free_rate / ann_factor
+    downside_excess = np.minimum(returns - _mar_daily, 0.0)
+    downside_dev = float(math.sqrt(float(np.mean(downside_excess ** 2))) * math.sqrt(ann_factor))
+    n_downside = int(np.count_nonzero(returns < _mar_daily))
+
+    if n_downside == 0 or downside_dev <= 0:
         sortino = _SORTINO_CEILING if excess_mu > 0 else 0.0
         sortino_reliable = False
         logger.warning(f"Sortino 下行样本为 0（总 {n} 个交易日无亏损），截断为 {_SORTINO_CEILING}，统计不可靠")
-    elif len(downside) < 30:
-        downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
-        raw_sortino = excess_mu / downside_std if downside_std > 0 else (float("inf") if excess_mu > 0 else 0.0)
-        sortino = min(raw_sortino, _SORTINO_CEILING)
-        sortino_reliable = False
-        logger.warning(f"Sortino 下行样本不足 ({len(downside)} < 30)，统计不可靠（sortino={sortino:.2f}）")
     else:
-        downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
-        raw_sortino = excess_mu / downside_std if downside_std > 0 else (float("inf") if excess_mu > 0 else 0.0)
+        raw_sortino = excess_mu / downside_dev
         sortino = min(raw_sortino, _SORTINO_CEILING)
+        if n_downside < 30:
+            sortino_reliable = False
+            logger.warning(f"Sortino 下行样本不足 ({n_downside} < 30)，统计不可靠（sortino={sortino:.2f}）")
 
     peak = np.maximum.accumulate(vals)  # type: ignore[arg-type]
     dd = (vals - peak) / peak

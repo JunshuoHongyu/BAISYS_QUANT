@@ -127,6 +127,9 @@ class CalibrationResult:
     # 避免"选择期 Sharpe"与"评估期 total_return/max_drawdown"混存被误读 ──
     sharpe_scope: str = ""
     oos_sharpe: float | None = None
+    # ── 全期（评估期）Sharpe（2026-11-09）：与 sharpe（选择期/holdout）并列保存，
+    # 使"低回撤/高收益"与"选择期 Sharpe"可在同一记录内交叉核对 ──
+    full_sharpe: float | None = None
     # ── 门控状态（区分合格参数与未达标但强制写入的参数）──
     gate_passed: bool = True
     gate_reasons: list[str] = field(default_factory=list)
