@@ -89,6 +89,109 @@ class ReportService:
         from DataManager.ColumnNames import get_final_column_order as _f
         return _f(fund_flow_periods)
 
+    # 合规硬性要求：股票简称中含 "ST"（不分大小写）的标的一律从报告中删除。
+    # 覆盖 ST / *ST / SST / S*ST 等全部风险警示写法；不复归 config 控制。
+    ST_NAME_KEYWORD = "st"
+
+    def _drop_st_named_rows(
+        self, sheets_data: dict[str, pd.DataFrame]
+    ) -> dict[str, pd.DataFrame]:
+        """删除各 sheet 中股票简称包含 "ST"（不区分大小写）的全部行。
+
+        匹配对象是股票简称（"股票简称" / "股票名称"；仅当 sheet 同时含
+        "股票代码" 列时才接受 akshare 原始列名 "name"），避免误删非股票名称列。
+        对于没有名称列但有 "股票代码" 列的 sheet（如主力成本分析/跟仓回测），
+        用主表识别出的 ST 代码集合一并剔除，保证整份报告口径一致。
+
+        Args:
+            sheets_data: sheet 名称 -> DataFrame 映射
+
+        Returns:
+            dict[str, pd.DataFrame]: 过滤后的 sheets_data（原始 df 不被就地修改）
+        """
+        if not sheets_data:
+            return sheets_data
+
+        primary_name_cols = (ColumnNames.STOCK_NAME, "股票名称")
+        fallback_name_col = ColumnNames.NAME_COL
+        code_col = ColumnNames.STOCK_CODE
+
+        def _name_col_of(df: pd.DataFrame) -> str | None:
+            col = next((c for c in primary_name_cols if c in df.columns), None)
+            if col is None and fallback_name_col in df.columns and code_col in df.columns:
+                # 仅在同时存在股票代码列时才用 akshare 原始 name 列，避免误伤
+                col = fallback_name_col
+            return col
+
+        def _st_mask(df: pd.DataFrame, name_col: str) -> pd.Series:
+            return df[name_col].astype(str).str.contains(
+                self.ST_NAME_KEYWORD, case=False, regex=False, na=False
+            )
+
+        # ── 第一遍：从主表（含股票简称的 sheet）收集 ST 标的代码与名称 ──
+        st_codes: set[str] = set()
+        removed_names: set[str] = set()
+        for df in sheets_data.values():
+            if df is None or df.empty:
+                continue
+            name_col = _name_col_of(df)
+            if name_col is None:
+                continue
+            mask = _st_mask(df, name_col)
+            if not mask.any():
+                continue
+            removed_names.update(df.loc[mask, name_col].astype(str).unique().tolist())
+            if code_col in df.columns:
+                from UtilsManager.CodeNormalizer import CodeNormalizer
+
+                st_codes.update(
+                    CodeNormalizer.normalize_series(df.loc[mask, code_col]).dropna().tolist()
+                )
+
+        # ── 第二遍：逐 sheet 剔除 ──
+        cleaned: dict[str, pd.DataFrame] = {}
+        total_removed = 0
+
+        for sheet_name, df in sheets_data.items():
+            if df is None or df.empty:
+                cleaned[sheet_name] = df
+                continue
+
+            name_col = _name_col_of(df)
+            if name_col is not None:
+                mask = _st_mask(df, name_col)
+                reason = "股票简称含 ST"
+            elif code_col in df.columns and st_codes:
+                from UtilsManager.CodeNormalizer import CodeNormalizer
+
+                mask = (
+                    CodeNormalizer.normalize_series(df[code_col])
+                    .isin(st_codes)
+                )
+                reason = "代码命中主表 ST 名单"
+            else:
+                cleaned[sheet_name] = df
+                continue
+
+            hit = int(mask.sum())
+            if not hit:
+                cleaned[sheet_name] = df
+                continue
+
+            total_removed += hit
+            cleaned[sheet_name] = df.loc[~mask].reset_index(drop=True)
+            self.logger.info(
+                f"  - [ST删除] 工作表 '{sheet_name}' 删除 {hit} 行（{reason}）"
+            )
+
+        if total_removed:
+            preview = ", ".join(sorted(removed_names)[:20]) or "(仅按代码)"
+            self.logger.info(
+                f"  - [ST删除] 报告共删除 {total_removed} 行，涉及 {len(removed_names) or len(st_codes)} 只标的: {preview}"
+            )
+
+        return cleaned
+
     def generate_excel_report(
         self,
         sheets_data: dict[str, pd.DataFrame],
@@ -116,6 +219,8 @@ class ReportService:
                 **{k: v for k, v in risk_sheets.items() if v is not None and not v.empty},
             }
         self.logger.info("\n>>> 正在生成 Excel 报告...")
+        # 合规硬性要求：股票简称含 ST（不分大小写）的标的从报告中直接删除
+        sheets_data = self._drop_st_named_rows(sheets_data)
         trade_date = today_str.replace("-", "") if today_str else datetime.datetime.now().strftime("%Y%m%d")
         report_path = os.path.join(self.config.HOME_DIRECTORY, f"审计报告_{trade_date}.xlsx")
 
