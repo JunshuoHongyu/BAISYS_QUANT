@@ -261,6 +261,9 @@ def _acceptance_gate(
     robust_pass: bool,
     pbo_gate: bool,
     dsr_gate: bool,
+    windows_sufficient: bool = True,
+    num_windows: int = 0,
+    min_windows: int = 0,
 ) -> tuple[bool, list[str]]:
     """P0-5：统一参数采纳门控（2026-11-04 起与数据库 adopted 标记联动）。
 
@@ -284,9 +287,13 @@ def _acceptance_gate(
     if not robust_pass:
         reasons.append("参数稳健性自检不通过")
     if not pbo_gate:
-        reasons.append("PBO > 5% 阈值（过拟合风险）")
+        reasons.append("PBO ≥ 0.5（过拟合风险）")
     if not dsr_gate:
-        reasons.append("DSR < 50% 阈值（缩水 Sharpe 不足）")
+        reasons.append("DSR < 动态阈值（缩水 Sharpe 显著性不足）")
+    if not windows_sufficient:
+        reasons.append(
+            f"有效窗口数不足（{num_windows} < {min_windows}），样本不足以支撑统计采纳"
+        )
     return (len(reasons) == 0), reasons
 
 
@@ -949,6 +956,8 @@ def run_backtest_pipeline(
         # holdout 激活时，业绩报告使用 holdout 终验 sharpe（末段 20% 独立回测），
         # WFO Top 5 均值仅用于参数选择，不对外报告。
         holdout_sharpe = None
+        # 作用域外保留 holdout 曲线：DSR 应基于 OOS/holdout 段而非全程 IS 曲线
+        holdout_equity = None
         if _holdout_active and _holdout_days > 0:
             try:
                 holdout_equity, _holdout_start_date = _holdout_equity_slice(
@@ -988,17 +997,44 @@ def run_backtest_pipeline(
         from BackTrading.calibration import _get_git_commit
         from BackTrading.prepare import _compute_config_hash
 
-        from BackTrading.overfitting import compute_pbo, compute_dsr_from_equity_curve
+        from BackTrading.overfitting import (
+            compute_pbo,
+            compute_dsr_from_equity_curve,
+            count_pbo_windows,
+            MIN_PBO_WINDOWS,
+        )
 
         wf_results_list = wf_result.to_dict("records") if not wf_result.empty else []
+        _wf_len = int(len(wf_result)) if not wf_result.empty else 0
+        # num_windows 用 PBO 的有效窗口口径（与 compute_pbo 内部一致），
+        # 而不是 DataFrame 行数——两者仅在窗口内 rank-1 数据缺失时才有差异，
+        # 那种窗口本就不该计入"样本量是否充足"的判断。
+        num_windows = count_pbo_windows(wf_results_list)
         pbo = compute_pbo(wf_results_list)
         num_combos = int(wf_result["num_combos"].iloc[0]) if not wf_result.empty and "num_combos" in wf_result.columns else 1
-        num_trials = num_combos * len(wf_result)
-        dsr = compute_dsr_from_equity_curve(equity_curve, num_trials)
+        num_trials = num_combos * max(_wf_len, 1)
+        # DSR 口径修复：优先用 holdout（独立 OOS）曲线，其次退回全程曲线。
+        # 用全程 IS 曲线算 DSR 只回答"样本内缩水后是否仍显著"，与泛化无关。
+        if holdout_equity is not None and len(holdout_equity) >= 20:
+            _dsr_curve = holdout_equity
+            _dsr_scope = "holdout"
+        else:
+            _dsr_curve = equity_curve
+            _dsr_scope = "full_period(IS)"
+        dsr = compute_dsr_from_equity_curve(_dsr_curve, num_trials)
 
-        logger.info(f"  Deflated Sharpe Ratio(DSR)={dsr:.2%} | PBO={pbo:.2%} | 试验次数={num_trials}")
-        if pbo > 0.5:
-            logger.warning(f"PBO={pbo:.2%}>50%，过拟合风险较高，建议缩减参数网格或增加数据")
+        _pbo_txt = "不可判定" if pbo is None else f"{pbo:.2%}"
+        logger.info(
+            f"  Deflated Sharpe Ratio(DSR)={dsr:.2%}（区间={_dsr_scope}） | "
+            f"PBO={_pbo_txt} | 试验次数={num_trials}（{num_windows} 窗口 × {num_combos} 组合）"
+        )
+        if pbo is None:
+            logger.warning(
+                f"  有效窗口数 {num_windows} < {MIN_PBO_WINDOWS}，PBO 不可判定，"
+                f"本次不将 PBO 作为过拟合拒绝理由（改由窗口数门槛 + DSR 把关）"
+            )
+        elif pbo >= 0.5:
+            logger.warning(f"PBO={pbo:.2%} ≥ 50%，过拟合风险较高，建议缩减参数网格或增加数据")
         _dsr_threshold = min(0.5, max(0.3, 0.5 * math.sqrt(100 / max(num_trials, 100))))
         if dsr < _dsr_threshold:
             logger.warning(f"DSR={dsr:.2%} < 动态阈值{_dsr_threshold:.2%}（试验{num_trials}次），统计显著性不足")
@@ -1164,9 +1200,12 @@ def run_backtest_pipeline(
             timestamp=datetime.now().isoformat(),
             git_commit=_get_git_commit(),
             config_hash=_compute_config_hash(),
-            pbo=round(pbo, 4),
+            pbo=None if pbo is None else round(pbo, 4),
             dsr=round(dsr, 4),
             num_trials=num_trials,
+            num_windows=num_windows,
+            sharpe_scope=_sharpe_scope,
+            oos_sharpe=holdout_sharpe,
             cost_model_snapshot=_cost_snapshot,
         )
 
@@ -1198,15 +1237,27 @@ def run_backtest_pipeline(
         # 衰减 + PBO/DSR 硬性拒绝 + 多重测试惩罚 + 稳健性 + 模拟验证；门控不通过
         # 时 record_run(adopted=false)，复盘自动忽略该参数集，杜绝 PBO 过拟合
         # 参数污染生产参考。
-        _pbo_gate = pbo <= 0.05
-        _dsr_gate = dsr >= 0.5
-        if not _pbo_gate:
+        # P0-Fix 2026-11-07：
+        #   1) PBO 阈值 0.05 → 0.5（Bailey/López de Prado 标准），与上方 warning 线统一。
+        #      旧阈值 0.05 在离散算法下（PBO = k/窗口数）几乎不可达，等于永久拒绝。
+        #   2) pbo=None（窗口数不足）不再作为过拟合拒绝理由，改由独立窗口数门槛把关。
+        #   3) DSR 使用上方已算出的动态阈值 _dsr_threshold，不再硬编码 0.5（双标准）。
+        _windows_sufficient = num_windows >= MIN_PBO_WINDOWS
+        _pbo_gate = True if pbo is None else (pbo < 0.5)
+        _dsr_gate = dsr >= _dsr_threshold
+        if pbo is not None and not _pbo_gate:
             logger.warning(
-                f"[过拟合防护] PBO={pbo:.4f} > 0.05 阈值，参数组统计显著性不足，拒绝采纳"
+                f"[过拟合防护] PBO={pbo:.4f} ≥ 0.5，参数组过拟合风险高，拒绝采纳"
             )
         if not _dsr_gate:
             logger.warning(
-                f"[过拟合防护] DSR={dsr:.4f} < 0.5 阈值，缩水 Sharpe 比过低，拒绝采纳"
+                f"[过拟合防护] DSR={dsr:.4f} < 动态阈值 {_dsr_threshold:.4f}"
+                f"（试验{num_trials}次），缩水 Sharpe 显著性不足，拒绝采纳"
+            )
+        if not _windows_sufficient:
+            logger.warning(
+                f"[过拟合防护] 有效窗口数 {num_windows} < {MIN_PBO_WINDOWS}，"
+                f"样本不足以支撑统计采纳（与 PBO 指标解耦，单独把关）"
             )
         _gate_pass, _gate_reasons = _acceptance_gate(
             promote=_promote,
@@ -1216,6 +1267,9 @@ def run_backtest_pipeline(
             robust_pass=_robust_pass,
             pbo_gate=_pbo_gate,
             dsr_gate=_dsr_gate,
+            windows_sufficient=_windows_sufficient,
+            num_windows=num_windows,
+            min_windows=MIN_PBO_WINDOWS,
         )
         # 标记门控状态到校准结果，供下游消费方区分合格/未达标参数
         cal_result.gate_passed = _gate_pass
@@ -1258,7 +1312,7 @@ def run_backtest_pipeline(
         if _gate_pass:
             logger.info("[采纳门控] 参数组通过统一采纳门控，calibration_result.json 已保存")
         else:
-            # 2026-11-04 熔断强化（用户审计建议一）：PBO>0.05 或 DSR<0.5 等任一硬门槛不通过
+            # 2026-11-04 熔断强化（用户审计建议一）：PBO/DSR/窗口数等任一硬门槛不通过
             # → 文件保留快照（gate_passed=false），但回测→复盘通道 record_run(adopted=false)，
             # 复盘自动沿用上一期 adopted 参数 / 出厂兜底 fallback_params，本次校准结果作废。
             logger.critical("=" * 60)
@@ -1268,7 +1322,8 @@ def run_backtest_pipeline(
                 f"（无上一期时走出厂兜底）。原因: " + "；".join(_gate_reasons)
             )
             logger.critical(
-                f"[熔断] 关键指标: PBO={pbo:.4f}(≤0.05 通过) | DSR={dsr:.4f}(≥0.5 通过) | "
+                f"[熔断] 关键指标: PBO={_pbo_txt}(<0.5 通过) | DSR={dsr:.4f}(≥{_dsr_threshold:.4f} 通过) | "
+                f"窗口数={num_windows}(≥{MIN_PBO_WINDOWS} 通过) | "
                 f"OOS衰减={'通过' if _oos_decay_pass else '不通过'} | "
                 f"显著性={'通过' if _sig_pass else '不通过'} | "
                 f"稳健性={'通过' if _robust_pass else '不通过'}"
@@ -1373,7 +1428,14 @@ def run_backtest_pipeline(
             sharpe=cal_result.sharpe,
             total_return=cal_result.total_return,
             max_drawdown=cal_result.max_drawdown,
-            extra_metrics=risk | trade | {"pbo": cal_result.pbo, "dsr": cal_result.dsr, "num_trials": cal_result.num_trials},
+            extra_metrics=risk | trade | {
+                "pbo": cal_result.pbo,
+                "dsr": cal_result.dsr,
+                "num_trials": cal_result.num_trials,
+                "num_windows": cal_result.num_windows,
+                "sharpe_scope": cal_result.sharpe_scope,
+                "oos_sharpe": cal_result.oos_sharpe,
+            },
             git_commit=cal_result.git_commit,
             config_hash=cal_result.config_hash,
             data_version=_data_version,

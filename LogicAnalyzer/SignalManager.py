@@ -76,7 +76,7 @@ class TASignalProcessor:
         for col in ['close', 'open', 'high', 'low', 'volume']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        df.dropna(subset=['close', 'open', 'high', 'low'], inplace=True)
+        df = df.dropna(subset=['close', 'open', 'high', 'low'])
         if df.empty:
             logger.debug("股票 %s 跳过: close/open/high/low 全部空值", pure_code)
             return None
@@ -86,8 +86,7 @@ class TASignalProcessor:
             logger.debug("股票 %s 跳过: 缺少必要列 %s", pure_code, missing_cols)
             return None
         if 'date' in df.columns:
-            df.sort_values('date', inplace=True)
-            df.reset_index(drop=True, inplace=True)
+            df = df.sort_values('date').reset_index(drop=True)
 
         # 注入最新市场价（AShareHub），供止损/目标价计算使用
         if spot_lookup and pure_code in spot_lookup:

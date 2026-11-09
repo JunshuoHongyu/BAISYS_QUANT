@@ -42,6 +42,24 @@ def compute_risk_metrics(
         return {}
 
     total_ret = vals[-1] / vals[0] - 1
+
+    # AUDIT 2026-11-07：极端日收益检测。
+    # 复权价跳变 / 初始资金未初始化 / 停牌估值回退都会制造单日巨幅跳变，
+    # 把 annual_vol 与 max_drawdown 拉到失真区间（曾出现 annual_vol=57.7%、
+    # max_dd=-48%，而同一条曲线按 (mu-rf)/sigma 反解 Sharpe 只有 -0.017 的矛盾组合）。
+    # 这里只告警不剔除，避免掩盖问题；调用方需据此核查数据。
+    _EXTREME_RET = 0.30
+    _extreme_mask = np.abs(returns) > _EXTREME_RET
+    outlier_days = int(_extreme_mask.sum())
+    if outlier_days:
+        _sample = ", ".join(
+            f"{returns[i]:+.2%}" for i in np.nonzero(_extreme_mask)[0][:5]
+        )
+        logger.warning(
+            f"净值曲线存在 {outlier_days} 个极端日收益（|r|>{_EXTREME_RET:.0%}）：{_sample}；"
+            f"annual_vol={returns.std(ddof=1) * math.sqrt(244):.2%} 与 max_drawdown 可能失真，"
+            f"请核查复权因子 / 初始资金 / 停牌估值"
+        )
     # AUDIT_FIX P1-7: 统一使用 ann_factor=244（A股年化交易日数），不分长短周期。
     # 短周期 Sharpe 本身统计不可靠（样本量不足），通过 min_observations 阈值拒绝输出。
     ann_factor = 244
@@ -61,6 +79,7 @@ def compute_risk_metrics(
             "sortino_ratio": None,
             "max_drawdown": round(float(((vals - np.maximum.accumulate(vals)) / vals).min()), 6),
             "n_observations": n,
+            "outlier_days": outlier_days,
             "warning": "样本不足",
         }
     mu = returns.mean() * ann_factor
@@ -133,6 +152,8 @@ def compute_risk_metrics(
         "max_turnover": round(max_turnover, 6),
         # #3 修复：输出 risk_free_rate 用于审计可追溯
         "risk_free_rate": risk_free_rate,
+        # AUDIT 2026-11-07：极端日收益天数（>0 表示 vol/dd 可能失真）
+        "outlier_days": outlier_days,
     }
 
 

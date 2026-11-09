@@ -387,8 +387,13 @@ def bayesian_walk_forward_multi(
             _pct90_idx = max(0, int(len(_ipo_sorted) * 0.9) - 1)
             _latest_ipo = _ipo_sorted[_pct90_idx]
             # 计算延迟：从 latest_ipo + warmup 起算第一个交易日索引
-            _safe_start_str = _latest_ipo + pd.Timedelta(days=_SIGNAL_WARMUP_DAYS + 365).strftime("%Y-%m-%d")[:10]
-            _safe_start_str = _safe_start_str.split("T")[0][:10]
+            # FIX(2026-11-07)：原写法 pd.Timedelta(days=N).strftime(...) 因运算符优先级
+            # 先执行 Timedelta.strftime → AttributeError（Timedelta 无该属性），
+            # 该分支一旦执行必然崩溃，导致 P1.17 动态延迟从未生效（offset 恒 0）。
+            _safe_start_ts = pd.Timestamp(_latest_ipo) + pd.Timedelta(
+                days=_SIGNAL_WARMUP_DAYS + 365
+            )
+            _safe_start_str = _safe_start_ts.strftime("%Y-%m-%d")[:10]
             matching_idx = [i for i, d in enumerate(unique_dates) if d >= _safe_start_str]
             if matching_idx:
                 _listing_offset = matching_idx[0]
@@ -695,11 +700,26 @@ def bayesian_walk_forward_multi(
                             f"训练期内拟合出的参数组合泛化能力不足，窗口结果废弃"
                         )
                         logger.warning("=" * 64)
+                    elif _otype == _OverfitType.INSUFFICIENT_EXPOSURE:
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(INSUFFICIENT_EXPOSURE) | "
+                            f"OOS_Vol={_decay_report.oos_annual_vol:.2%}、"
+                            f"OOS_Ret={_decay_report.oos_total_return:.2%}，"
+                            f"账户近乎空仓，Sharpe 无统计意义，窗口无效（不计入系统性失败）"
+                        )
+                    elif _otype == _OverfitType.NO_EDGE:
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(NO_EDGE) | "
+                            f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
+                            f"OOS_Ret={_decay_report.oos_total_return:.2%}、"
+                            f"OOS_MDD={_decay_report.oos_max_drawdown:.2%}，"
+                            f"样本外基本打平（非亏损型失效），窗口无效（不计入系统性失败）"
+                        )
                     else:  # WEAK
                         logger.warning(
                             f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(WEAK) | "
                             f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
-                            f"策略信号偏弱，结果仅供参考"
+                            f"策略信号偏弱，结果仅供参考（不计入系统性失败）"
                         )
                 else:
                     logger.warning(
@@ -708,21 +728,28 @@ def bayesian_walk_forward_multi(
                         f"该窗口结果直接废弃"
                     )
 
+                # P0-2 / P1-4：只有"真实过拟合 / 策略无效"计入系统性失败；
+                # NO_EDGE（样本外打平）、INSUFFICIENT_EXPOSURE（近乎空仓）、
+                # WEAK（信号偏弱）仅废弃当前窗口，不应否决整条路径。
+                _counts_as_failure = True
+                if _decay_report is not None:
+                    _counts_as_failure = bool(
+                        _decay_report.overfit_type.counts_as_systematic_failure
+                    )
+                if not _counts_as_failure:
+                    _consecutive_oos_failures = 0
+                    continue
+
                 _consecutive_oos_failures += 1
                 if _consecutive_oos_failures >= _MAX_CONSECUTIVE_OOS_FAILURES:
+                    # P0-3：只终止当前路径，其余路径继续跑。多路径 WFO 的意义是
+                    # 多路径聚合中位数，单条路径恰好落在最差 regime 时不应否决全局。
                     logger.critical(
-                        f"连续 {_consecutive_oos_failures} 个窗口 OOS 全部失效"
-                        f"（单窗口耗时 ~2-3h），策略在当前数据区间系统性泛化失败，"
-                        f"提前终止 WFO"
+                        f"  [{path_idx + 1}] 连续 {_consecutive_oos_failures} 个窗口 OOS "
+                        f"系统性失效（真实过拟合/策略无效），提前终止本路径，"
+                        f"其余路径继续执行"
                     )
-                    mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                    raise WFOSystematicFailure(
-                        fallback_params=mid,
-                        reason=f"连续 {_consecutive_oos_failures} 个窗口 OOS 衰减校验全部失败；"
-                               f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}；"
-                               f"策略在当前数据区间无泛化能力",
-                        failed_windows=_consecutive_oos_failures,
-                    )
+                    break
                 continue
 
             # ── DM 检验（P2.2）：仅在 IS_Sharpe > 0 时执行 ──

@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     pbo             NUMERIC(6,4) DEFAULT 0.0,
     dsr             NUMERIC(6,4) DEFAULT 0.0,
     num_trials      INT DEFAULT 0,
+    num_windows     INT DEFAULT 0,
+    sharpe_scope    VARCHAR(32) DEFAULT '',
+    oos_sharpe      NUMERIC(8,4),
     adopted         BOOLEAN     NOT NULL DEFAULT FALSE,
     direction_audit JSONB
 );
@@ -75,6 +78,13 @@ def ensure_table(engine: Any) -> None:
         ("pbo", "NUMERIC(6,4) DEFAULT 0.0"),
         ("dsr", "NUMERIC(6,4) DEFAULT 0.0"),
         ("num_trials", "INT DEFAULT 0"),
+        # 2026-11-07 指标口径拆解：pbo=0.05 阈值不可达修复后，需显式记录
+        # PBO 的有效窗口数（PBO 是 k/窗口数 的离散值，窗口数不足时不可判定）；
+        # sharpe_scope 标明 sharpe 属于哪个区间（holdout / WFO Top5 均值），
+        # 避免与评估期的 total_return/max_drawdown 混读。
+        ("num_windows", "INT DEFAULT 0"),
+        ("sharpe_scope", "VARCHAR(32) DEFAULT ''"),
+        ("oos_sharpe", "NUMERIC(8,4)"),
         # 2026-11-04 架构改造：校准结果从 config.ini 迁入数据库后，
         # 需要 adopted 区分"门控通过已采纳"与"未采纳"——历史记录默认 FALSE，
         # 复盘读取只认 adopted=TRUE，历史未采纳记录不会污染复盘参数。
@@ -141,6 +151,7 @@ def get_last_adopted_run(engine: Any) -> dict[str, Any] | None:
                initial_cash, params, sharpe, sortino, calmar, total_return,
                annual_return, max_drawdown, win_rate, profit_factor, total_trades,
                status, config_hash, data_version, git_commit, pbo, dsr, num_trials,
+               num_windows, sharpe_scope, oos_sharpe,
                adopted, direction_audit
         FROM {TABLE}
         WHERE status = 'success' AND adopted = TRUE
@@ -278,6 +289,9 @@ def record_run(
     pbo = metrics.pop("pbo", 0.0)
     dsr = metrics.pop("dsr", 0.0)
     num_trials = metrics.pop("num_trials", 0)
+    num_windows = metrics.pop("num_windows", 0)
+    sharpe_scope = metrics.pop("sharpe_scope", "") or ""
+    oos_sharpe = metrics.pop("oos_sharpe", None)
     # 2026-11-04：门控语义显式化——None（旧调用方）视为未采纳 FALSE，
     # 复盘读取只认 adopted=TRUE；gate_passed=false 的"成功"记录不再被误采纳。
     if adopted is None:
@@ -289,13 +303,13 @@ def record_run(
              initial_cash, params, sharpe, total_return, max_drawdown, status,
              sortino, calmar, var_95, cvar_95, win_rate, profit_factor, total_trades,
              git_commit, config_hash, data_version, pbo, dsr, num_trials, adopted,
-             direction_audit)
+             direction_audit, num_windows, sharpe_scope, oos_sharpe)
         VALUES
             (NOW(), :frequency, :backtest_start_date, :out_of_sample_days,
              :initial_cash, CAST(:params AS jsonb), :sharpe, :total_return, :max_drawdown, :status,
              :sortino, :calmar, :var_95, :cvar_95, :win_rate, :profit_factor, :total_trades,
              :git_commit, :config_hash, :data_version, :pbo, :dsr, :num_trials, :adopted,
-             CAST(:direction_audit AS jsonb))
+             CAST(:direction_audit AS jsonb), :num_windows, :sharpe_scope, :oos_sharpe)
     """)
     with engine.begin() as conn:
         conn.execute(sql, _pyval({
@@ -321,6 +335,9 @@ def record_run(
             "pbo": pbo,
             "dsr": dsr,
             "num_trials": num_trials,
+            "num_windows": num_windows,
+            "sharpe_scope": sharpe_scope,
+            "oos_sharpe": oos_sharpe,
             "adopted": adopted,
             "direction_audit": json.dumps(_pyval(direction_audit or {}), ensure_ascii=False),
         }))

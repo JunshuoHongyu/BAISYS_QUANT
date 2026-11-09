@@ -846,7 +846,15 @@ def _run_single_backtest(
         s_sig_close: np.ndarray | None = None,
         s_force: bool = False,
         s_reason: str | None = None,
+        unfilled_sell_acc: list | None = None,
     ):
+        """卖出撮合。
+
+        FIX(UnboundLocalError)：本函数是 _run_single_backtest 的嵌套函数，而
+        `_u_sell` 是 _flush_pending 的局部变量——两者不在同一作用域，`_u_sell +=`
+        会被 Python 判定为本地变量并抛 UnboundLocalError。改为显式传入可变累加器
+        （单元素 list），由 _flush_pending 负责初始化与读取。
+        """
         total_sold = 0.0
         for j in range(len(s_syms)):
             si = s_idx[j]
@@ -887,7 +895,8 @@ def _run_single_backtest(
                     _sink_inc("sell_limit_rejected", 1)
                     _sink_val("sell_limit_unfilled_value", float(_req) * float(s_close[j]))
 
-                    _u_sell += float(_req) * float(s_close[j])
+                    if unfilled_sell_acc is not None:
+                        unfilled_sell_acc[0] += float(_req) * float(s_close[j])
                     _day_agg["reject_sell"] += 1
                     logger.debug(
                         f"[撮合约束] {dt} {s_syms[j]} {_updown} 可成交量不足 → 未成交（卖出） 请求={_req}股 可成交={_avail}股"
@@ -896,7 +905,8 @@ def _run_single_backtest(
                 if _avail < sell_shares:
                     _sink_inc("sell_limit_partial", 1)
                     _sink_val("sell_limit_unfilled_value", float(_req - _avail) * float(s_close[j]))
-                    _u_sell += float(_req - _avail) * float(s_close[j])
+                    if unfilled_sell_acc is not None:
+                        unfilled_sell_acc[0] += float(_req - _avail) * float(s_close[j])
                     sell_shares = _avail
                     _limit_note = s_limit_tag[j] if s_limit_tag is not None else "down"
                     _day_agg["partial_sell"] += 1
@@ -1120,7 +1130,10 @@ def _run_single_backtest(
         if not _pending_sells and not _pending_buys:
             return 0.0, 0.0
         buy_val, sell_val = 0.0, 0.0
-        _u_buy, _u_sell = 0.0, 0.0  # 当日未成交金额（stats_sink worst-case 用）
+        _u_buy = 0.0
+        # FIX(UnboundLocalError)：_u_sell 用单元素 list 承载，供嵌套函数 _process_sell
+        # 通过 unfilled_sell_acc 参数累加（跨作用域写入必须显式传引用）。
+        _u_sell = [0.0]  # 当日卖出未成交金额（stats_sink worst-case 用）
         sym_row = {s: j for j, s in enumerate(syms_str_ld)}
 
         def _auction_fill_for(sym: str, j: int, side: str = "sell", force: bool = False) -> float:
@@ -1249,6 +1262,7 @@ def _run_single_backtest(
                     s_limit_tag=["down"] if _limit_tag_ld is not None else None,
                     s_sig_close=None,
                     s_reason=p.get("reason"),
+                    unfilled_sell_acc=_u_sell,
                 )
                 sell_val += _tp1_sold_val
                 # FIX(B2): T1 分段止盈挂单成交（哪怕部分成交）→ 剩余仓位进入 T2 档 + 保本止损
@@ -1295,6 +1309,7 @@ def _run_single_backtest(
                 s_sig_close=np.array([float(p["sig_close"])]),
                 s_force=bool(p.get("force", False)),
                 s_reason=p.get("reason"),
+                unfilled_sell_acc=_u_sell,
             )
             sell_val += _tp1_sold_val
             # FIX(B2): T1 分段止盈挂单成交（哪怕部分成交）→ 剩余仓位进入 T2 档 + 保本止损
@@ -1595,7 +1610,7 @@ def _run_single_backtest(
             filled += 1
         _pending_buys[:] = remaining_buys
         _sink_worst("buy_limit_worst_day", dt, _u_buy)
-        _sink_worst("sell_limit_worst_day", dt, _u_sell)
+        _sink_worst("sell_limit_worst_day", dt, _u_sell[0])
         return buy_val, sell_val
 
     _market_multiplier = 1.0

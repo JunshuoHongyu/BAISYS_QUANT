@@ -119,9 +119,14 @@ class CalibrationResult:
     timestamp: str = ""
     git_commit: str = ""
     config_hash: str = ""
-    pbo: float = 0.0
+    pbo: float | None = 0.0
     dsr: float = 0.0
     num_trials: int = 0
+    num_windows: int = 0
+    # ── 指标口径（P1-Fix 2026-11-07）：区分 sharpe 的区间与评估期指标，
+    # 避免"选择期 Sharpe"与"评估期 total_return/max_drawdown"混存被误读 ──
+    sharpe_scope: str = ""
+    oos_sharpe: float | None = None
     # ── 门控状态（区分合格参数与未达标但强制写入的参数）──
     gate_passed: bool = True
     gate_reasons: list[str] = field(default_factory=list)
